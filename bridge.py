@@ -143,17 +143,6 @@ async def exec_cmd(c: dict):
         await write(cmd_heat(on, heat_idx), to)
         log(f"🔥 {where}加热开（通道 {heat_idx}）" if on else f"❄️ {where}加热关"); return
 
-    if t == "raw":
-        # 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/5/8/9（都走 FFE1 控制通道）
-        try:
-            b = bytes(int(x, 16) for x in str(c.get("hex", "")).replace(",", " ").split())
-        except ValueError:
-            b = b""
-        if not (6 <= len(b) <= 8 and b[0] == 0x55 and b[1] in (3, 4, 5, 8, 9)):
-            log(f"🚫 拒绝原始指令：{c.get('hex')}"); return
-        current_cmd = b; current_until = parse_duration(c)
-        await write(b, "all"); log(f"🧪 原始指令 {b.hex(' ')}"); return
-
     func = "vibrate" if (t == "pattern" or "pattern" in c) else t if t in ("suck", "stretch") else None
     if func:
         lv = float(c.get("level", 0.6))

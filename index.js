@@ -6,7 +6,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json());
 
-// 允许从其他来源打开的中继网页访问（本地 toy.html、别的静态站）
+// 允许从其他来源打开的中继网页访问（例如本地打开的 relay.html）
 // 没有这段，浏览器预检 OPTIONS 会被 404 挡掉，中继请求根本到不了 /toy-next
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
@@ -71,7 +71,6 @@ const MAX_RUN_SEC = 30 * 60; // 安全上限：任何序列最多跑 30 分钟�
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 let seq = null; // { name, steps, loop, idx, round, timer, startedAt }
-const presets = new Map(); // 内存保存，服务重启会清空
 
 function normalizeStep(st) {
   const sec = clamp(Number(st.sec) || 0, MIN_STEP_SEC, 600);
@@ -92,10 +91,11 @@ function normalizeStep(st) {
       sec
     };
   }
-  if (st.pattern !== undefined) {
+  const vib = st.vibrate ?? st.pattern;
+  if (vib !== undefined) {
     return {
       kind: "pattern",
-      pattern: clamp(Math.round(Number(st.pattern) || 1), 1, 10),
+      pattern: clamp(Math.round(Number(vib) || 1), 1, 10),
       level: clamp(Number(st.level ?? 0.7), 0, 1),
       sec
     };
@@ -142,16 +142,6 @@ function startSeq(name, rawSteps, loop) {
   return one;
 }
 
-// 渐变：在 sec 秒内从 from 平滑过渡到 to，拆成若干小步
-function rampSteps(from, to, sec) {
-  const n = clamp(Math.round(sec / 1), 2, 40);
-  const each = Math.max(MIN_STEP_SEC, sec / n);
-  return Array.from({ length: n }, (_, i) => ({
-    speed: +(from + (to - from) * (i / (n - 1))).toFixed(3),
-    sec: each
-  }));
-}
-
 function checkSecret(req, res, next) {
   const secret = req.params.secret || req.query.secret || req.headers["x-bridge-secret"];
   if (secret !== SECRET) {
@@ -176,13 +166,6 @@ app.get("/toy-next", checkSecret, (req, res) => {
   res.json({ type: "hello" });
 });
 
-// 测试用：直接设置指令
-app.post("/toy", checkSecret, (req, res) => {
-  currentCmd = req.body;
-  lastUpdate = Date.now();
-  res.json({ ok: true });
-});
-
 // ---------------- MCP（Streamable HTTP + JSON-RPC 2.0） ----------------
 
 const TOOLS = [
@@ -199,15 +182,15 @@ const TOOLS = [
     }
   },
   {
-    name: "toy_set_pattern",
+    name: "toy_vibrate",
     description: "设置主体的震动花样（10 种）和强度",
     inputSchema: {
       type: "object",
       properties: {
-        pattern: { type: "number", description: "震动花样 1-10" },
-        level: { type: "number", description: "0.0-1.0" }
-      },
-      required: ["pattern"]
+        mode: { type: "number", description: "震动花样 1-10，默认 1" },
+        level: { type: "number", description: "强度 0-1，默认 0.7" },
+        sec: { type: "number", description: "持续秒数，可选" }
+      }
     }
   },
   {
@@ -243,21 +226,9 @@ const TOOLS = [
         on: { type: "boolean", description: "true 开，false 关" },
         target: { type: "string", enum: ["body", "sucker", "both"], description: "body = 主体，sucker = 吸头，both = 两个，默认 both" },
         minutes: { type: "number", description: "开多久后自动关，默认 15，最多 30" },
-        idx: { type: "number", description: "加热通道号，一般不填（吸头默认 1，已实测；主体默认 2，待实测）。只在调试时填" }
+        idx: { type: "number", description: "加热通道号，一般不填（吸头 1，已实测；主体默认 2，待实测）。只在测主体加热时换着试" }
       },
       required: ["on"]
-    }
-  },
-  {
-    name: "toy_raw",
-    description: "调试用：直接发一条原始 BLE 指令（十六进制，空格分隔），用来实测新指令格式。只允许 55 开头、6-8 字节、指令号 03/04/05/08/09。默认 sec 秒后自动停",
-    inputSchema: {
-      type: "object",
-      properties: {
-        hex: { type: "string", description: "例如 \"55 09 00 00 01 05 00\"" },
-        sec: { type: "number", description: "持续秒数，默认 5" }
-      },
-      required: ["hex"]
     }
   },
   {
@@ -272,22 +243,22 @@ const TOOLS = [
   },
   {
     name: "toy_sequence",
-    description: "按节奏自动切换强度/花样（例如强弱交替、波浪、停顿再加强）。服务器按时间自动推进，跑完自动停。发 toy_set_speed / toy_set_pattern / toy_stop 会打断当前序列。",
+    description: "按节奏自动切换模式和强度（例如强弱交替、渐强、停顿再加强）。服务器按时间自动推进，跑完自动停。发其他控制指令或 toy_stop 会打断当前序列。",
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string", description: "给这段节奏起个名字，可选" },
         steps: {
           type: "array",
-          description: "按顺序执行的步骤。每步填一种：speed（0-1，整体强度）、pattern（1-10，主体震动花样）、stretch（1-7，主体伸缩模式）或 suck（1-5，吸头吮吸模式），后三种配 level 0-1，再填 sec（这一步持续几秒，最少 0.5）。speed 为 0 表示停顿。最多 60 步。",
+          description: "按顺序执行的步骤。每步填一种：suck（1-5，吸头吮吸模式）、vibrate（1-10，主体震动花样）、stretch（1-7，主体伸缩模式）或 speed（0-1，整体强度）；前三种配 level 0-1；再填 sec（这一步持续几秒，最少 0.5）。speed 为 0 表示停顿。最多 60 步。",
           items: {
             type: "object",
             properties: {
               speed: { type: "number", description: "强度 0-1；0 = 停顿" },
-              pattern: { type: "number", description: "主体震动花样 1-10" },
+              vibrate: { type: "number", description: "主体震动花样 1-10（配 level）" },
               suck: { type: "number", description: "吸头吮吸模式 1-5（1=持续不间断，2=连续+断续一下，3=间隔连续，4=只断续，5=断续与连续交替），配 level" },
               stretch: { type: "number", description: "主体伸缩模式 1-7（配 level）" },
-              level: { type: "number", description: "花样强度 0-1" },
+              level: { type: "number", description: "模式强度 0-1；吮吸低于 0.5 时模式差别不明显" },
               sec: { type: "number", description: "这一步持续秒数" }
             },
             required: ["sec"]
@@ -298,94 +269,25 @@ const TOOLS = [
       required: ["steps"]
     }
   },
-  {
-    name: "toy_ramp",
-    description: "强度渐变：在 sec 秒内从 from 平滑升到（或降到）to，可选再保持 hold 秒，结束后自动停",
-    inputSchema: {
-      type: "object",
-      properties: {
-        from: { type: "number", description: "起始强度 0-1" },
-        to: { type: "number", description: "目标强度 0-1" },
-        sec: { type: "number", description: "渐变用时（秒），2-600" },
-        hold: { type: "number", description: "到达目标后保持几秒，可选" }
-      },
-      required: ["from", "to", "sec"]
-    }
-  },
-  {
-    name: "toy_preset_save",
-    description: "把一段节奏保存成预设，之后可以按名字直接调用。保存在服务器内存里，服务重启会清空",
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: { type: "string" },
-        steps: {
-          type: "array",
-          description: "按顺序执行的步骤。每步填一种：speed（0-1，整体强度）、pattern（1-10，主体震动花样）、stretch（1-7，主体伸缩模式）或 suck（1-5，吸头吮吸模式），后三种配 level 0-1，再填 sec（这一步持续几秒，最少 0.5）。speed 为 0 表示停顿。最多 60 步。",
-          items: {
-            type: "object",
-            properties: {
-              speed: { type: "number", description: "强度 0-1；0 = 停顿" },
-              pattern: { type: "number", description: "主体震动花样 1-10" },
-              suck: { type: "number", description: "吸头吮吸模式 1-5（1=持续不间断，2=连续+断续一下，3=间隔连续，4=只断续，5=断续与连续交替），配 level" },
-              stretch: { type: "number", description: "主体伸缩模式 1-7（配 level）" },
-              level: { type: "number", description: "花样强度 0-1" },
-              sec: { type: "number", description: "这一步持续秒数" }
-            },
-            required: ["sec"]
-          }
-        },
-        loop: { description: "true = 一直循环直到叫停（最多 30 分钟）；数字 = 重复几轮；不填 = 只跑一轮", anyOf: [{ type: "boolean" }, { type: "number" }] }
-      },
-      required: ["name", "steps"]
-    }
-  },
-  {
-    name: "toy_preset_list",
-    description: "列出已保存的预设",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "toy_preset_play",
-    description: "按名字播放一个已保存的预设",
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: { type: "string" },
-        loop: { description: "true = 一直循环直到叫停（最多 30 分钟）；数字 = 重复几轮；不填 = 只跑一轮", anyOf: [{ type: "boolean" }, { type: "number" }] }
-      },
-      required: ["name"]
-    }
-  },
-  {
-    name: "toy_preset_delete",
-    description: "删除一个预设",
-    inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] }
-  }
 ];
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 
 function callTool(name, args) {
   switch (name) {
-    case "toy_set_speed":
+    case "toy_set_speed": {
       cancelSeq();
-      currentCmd = {
-        type: "speed",
-        speed: Math.max(0, Math.min(1, Number(args.speed) || 0)),
-        sec: Number(args.sec) || 0
-      };
-      lastUpdate = Date.now();
-      return text(`已设置强度 ${currentCmd.speed}`);
-    case "toy_set_pattern":
+      const speed = clamp(Number(args.speed) || 0, 0, 1);
+      pushCmd({ type: "speed", speed, sec: Number(args.sec) || 0 });
+      return text(`已设置强度 ${speed}`);
+    }
+    case "toy_vibrate": {
       cancelSeq();
-      currentCmd = {
-        type: "pattern",
-        pattern: Math.max(1, Math.min(10, Math.round(Number(args.pattern) || 1))),
-        level: Math.max(0, Math.min(1, args.level ?? 0.7))
-      };
-      lastUpdate = Date.now();
-      return text(`已设置花样 ${currentCmd.pattern}`);
+      const mode = clamp(Math.round(Number(args.mode ?? args.pattern) || 1), 1, 10);
+      const level = clamp(Number(args.level ?? 0.7), 0, 1);
+      pushCmd({ type: "pattern", pattern: mode, level, sec: Number(args.sec) || 0 });
+      return text(`已设置震动花样 ${mode}，强度 ${level}`);
+    }
     case "toy_suck": {
       cancelSeq();
       const mode = clamp(Math.round(Number(args.mode) || 1), 1, 5);
@@ -411,22 +313,9 @@ function callTool(name, args) {
       setHeat(target, false, idx);
       return text(`已关闭${where}加热`);
     }
-    case "toy_raw": {
-      const parts = String(args.hex || "").trim().split(/[\s,]+/);
-      const bytes = parts.map((h) => parseInt(h, 16));
-      if (bytes.length < 6 || bytes.length > 8 || bytes.some((b) => !(b >= 0 && b <= 255)) ||
-          bytes[0] !== 0x55 || ![3, 4, 5, 8, 9].includes(bytes[1])) {
-        throw new Error("只允许 55 开头、6-8 字节、指令号 03/04/05/08/09 的指令");
-      }
-      cancelSeq();
-      const hex = bytes.map((b) => b.toString(16).padStart(2, "0")).join(" ");
-      pushCmd({ type: "raw", hex, sec: clamp(Number(args.sec) || 5, 1, 60) });
-      return text(`已发送原始指令 ${hex}`);
-    }
     case "toy_stop":
       cancelSeq();
-      currentCmd = { type: "stop" };
-      lastUpdate = Date.now();
+      pushCmd({ type: "stop" });
       if (anyHeat()) { setHeat("both", false); return text("已停止，加热也已关闭"); }
       return text("已停止");
     case "toy_status": {
@@ -449,34 +338,6 @@ function callTool(name, args) {
       const loopText = loop === true ? "，循环直到叫停（最多 30 分钟）" : typeof loop === "number" && loop > 1 ? `，重复 ${loop} 轮` : "";
       return text(`已开始序列「${args.name || "临时序列"}」：${args.steps.length} 步，一轮约 ${one.toFixed(1)} 秒${loopText}`);
     }
-    case "toy_ramp": {
-      const from = clamp(Number(args.from ?? 0), 0, 1);
-      const to = clamp(Number(args.to ?? 1), 0, 1);
-      const sec = clamp(Number(args.sec) || 10, 2, 600);
-      const steps = rampSteps(from, to, sec);
-      if (args.hold) steps.push({ speed: to, sec: clamp(Number(args.hold), MIN_STEP_SEC, 600) });
-      startSeq(`渐变 ${from}→${to}`, steps, false);
-      return text(`已开始渐变：${sec} 秒内从 ${from} 到 ${to}` + (args.hold ? `，然后保持 ${args.hold} 秒` : "") + "，结束后自动停");
-    }
-    case "toy_preset_save": {
-      if (!args.name) throw new Error("需要 name");
-      if (!Array.isArray(args.steps) || !args.steps.length) throw new Error("steps 不能为空");
-      presets.set(args.name, { steps: args.steps.slice(0, MAX_STEPS), loop: args.loop ?? false });
-      return text(`已保存预设「${args.name}」（${args.steps.length} 步）。注意：服务器重启后预设会清空`);
-    }
-    case "toy_preset_list": {
-      if (!presets.size) return text("还没有保存的预设");
-      return text([...presets].map(([n, p]) => `- ${n}：${p.steps.length} 步${p.loop ? "，循环" : ""}\n  ${JSON.stringify(p.steps)}`).join("\n"));
-    }
-    case "toy_preset_play": {
-      const p = presets.get(args.name);
-      if (!p) return text(`没有叫「${args.name}」的预设。先用 toy_preset_list 看看有哪些`);
-      const loop = args.loop ?? p.loop;
-      const one = startSeq(args.name, p.steps, loop);
-      return text(`已开始预设「${args.name}」，一轮约 ${one.toFixed(1)} 秒`);
-    }
-    case "toy_preset_delete":
-      return text(presets.delete(args.name) ? `已删除预设「${args.name}」` : `没有叫「${args.name}」的预设`);
     default:
       return null;
   }
@@ -496,7 +357,7 @@ function handleRpc(msg) {
       return ok({
         protocolVersion: PROTOCOL_VERSIONS.includes(wanted) ? wanted : PROTOCOL_VERSIONS[0],
         capabilities: { tools: {} },
-        serverInfo: { name: "svakom-bridge", version: "1.7.0" }
+        serverInfo: { name: "svakom-bridge", version: "2.0.0" }
       });
     }
     case "ping":
