@@ -107,6 +107,9 @@ const cmdScaleStop = () => new Uint8Array([H, 4, 0, 0, 0, 0, 0xAA]);
 const FUNCS = { vibrate: { no: 3, modes: 10 }, stretch: { no: 8, modes: 7 }, suck: { no: 9, modes: 5 } };
 const cmdFunc = (f, mode, level) =>
   new Uint8Array([H, FUNCS[f].no, 0, 0, clampB(mode, 1, FUNCS[f].modes), clampB(level, 1, 10), 0]);
+// 加热：开 55 05 01 37 <通道> 00 00，关 55 05 00 00 <通道> 00 00
+const cmdHeat = (on, idx) => new Uint8Array(on ? [H, 5, 1, 0x37, idx, 0, 0] : [H, 5, 0, 0, idx, 0, 0]);
+let heatIdx = 2;
 const cmdFuncOff = (f) => new Uint8Array([H, FUNCS[f].no, 0, 0, 0, 0, 0]);
 // 官方 App 连上后约 240ms 发的初始化握手，没有它后面的指令不生效
 const INIT_SEQ = [
@@ -149,13 +152,24 @@ async function stopNow(reason) {
 
 async function execCmd(c) {
   // 兼容服务器的 {type:"stop"} 和旧格式 {stop:true}
-  if (c.type === "stop" || c.stop) return stopNow("停止");
+  if (c.type === "stop" || c.stop) {
+    await stopNow("停止");
+    await write(cmdHeat(false, heatIdx));
+    return;
+  }
 
-  // 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/8/9（都走 FFE1 控制通道）
+  // 加热：只发一次，不进续命，也不影响正在跑的震动/吮吸
+  if (c.type === "heat") {
+    heatIdx = clampB(Number(c.idx ?? 2), 0, 255);
+    await write(cmdHeat(!!c.on, heatIdx));
+    return log(c.on ? `🔥 加热开（通道 ${heatIdx}）` : "❄️ 加热关");
+  }
+
+  // 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/5/8/9（都走 FFE1 控制通道）
   if (c.type === "raw") {
     const bytes = String(c.hex || "").trim().split(/[\s,]+/).map((h) => parseInt(h, 16));
     if (bytes.length < 6 || bytes.length > 8 || bytes.some((b) => !(b >= 0 && b <= 255)) ||
-        bytes[0] !== 0x55 || ![3, 4, 8, 9].includes(bytes[1])) {
+        bytes[0] !== 0x55 || ![3, 4, 5, 8, 9].includes(bytes[1])) {
       return log("🚫 拒绝原始指令：" + c.hex);
     }
     currentBuf = new Uint8Array(bytes);

@@ -56,6 +56,14 @@ def cmd_func(f, mode, level):
     return bytes([H, no, 0, 0, clampb(mode, 1, modes), clampb(level, 1, 10), 0])
 
 
+# 加热：开 55 05 01 37 <通道> 00 00，关 55 05 00 00 <通道> 00 00
+heat_idx = 2
+
+
+def cmd_heat(on, idx):
+    return bytes([H, 5, 1, 0x37, idx, 0, 0] if on else [H, 5, 0, 0, idx, 0, 0])
+
+
 def cmd_func_off(f): return bytes([H, FUNCS[f][0], 0, 0, 0, 0, 0])
 
 
@@ -95,18 +103,25 @@ async def switch_to(buf):
 
 
 async def exec_cmd(c: dict):
-    global current_cmd, current_until
+    global current_cmd, current_until, heat_idx
     t = c.get("type")
     if c.get("stop") or t == "stop":
-        await stop_all(); log("⏹ 停止"); return
+        await stop_all(); await write(cmd_heat(False, heat_idx)); log("⏹ 停止"); return
+
+    if t == "heat":
+        # 加热：只发一次，不进续命，也不影响正在跑的震动/吮吸
+        heat_idx = clampb(float(c.get("idx", 2)), 0, 255)
+        on = bool(c.get("on"))
+        await write(cmd_heat(on, heat_idx))
+        log(f"🔥 加热开（通道 {heat_idx}）" if on else "❄️ 加热关"); return
 
     if t == "raw":
-        # 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/8/9（都走 FFE1 控制通道）
+        # 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/5/8/9（都走 FFE1 控制通道）
         try:
             b = bytes(int(x, 16) for x in str(c.get("hex", "")).replace(",", " ").split())
         except ValueError:
             b = b""
-        if not (6 <= len(b) <= 8 and b[0] == 0x55 and b[1] in (3, 4, 8, 9)):
+        if not (6 <= len(b) <= 8 and b[0] == 0x55 and b[1] in (3, 4, 5, 8, 9)):
             log(f"🚫 拒绝原始指令：{c.get('hex')}"); return
         current_cmd = b; current_until = parse_duration(c)
         await write(b); log(f"🧪 原始指令 {b.hex(' ')}"); return

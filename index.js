@@ -33,6 +33,24 @@ function pushCmd(cmd) {
   lastUpdate = Date.now();
 }
 
+// 加热单独一个槽位，不会被震动/吮吸指令覆盖掉
+let pendingHeat = null;
+let heat = { on: false, idx: 2, until: 0, timer: null };
+const HEAT_MAX_MIN = 30;
+
+function setHeat(on, idx, minutes) {
+  if (heat.timer) clearTimeout(heat.timer);
+  heat = { on, idx, until: 0, timer: null };
+  pendingHeat = { type: "heat", on, idx, at: Date.now() };
+  if (on) {
+    const min = clamp(Number(minutes) || 15, 1, HEAT_MAX_MIN);
+    heat.until = Date.now() + min * 60000;
+    heat.timer = setTimeout(() => setHeat(false, idx), min * 60000);
+    return min;
+  }
+  return 0;
+}
+
 // ---------------- 节奏序列（服务器按时间一步步切换指令） ----------------
 
 const MAX_STEPS = 60;
@@ -134,6 +152,11 @@ function checkSecret(req, res, next) {
 // 中继轮询：获取下一条指令
 app.get("/toy-next", checkSecret, (req, res) => {
   lastPoll = Date.now();
+  if (pendingHeat) {
+    const h = pendingHeat;
+    pendingHeat = null;
+    if (Date.now() - h.at < 60000) return res.json({ type: "heat", on: h.on, idx: h.idx });
+  }
   if (currentCmd && Date.now() - lastUpdate < 15000) {
     const cmd = currentCmd;
     currentCmd = null;
@@ -201,8 +224,21 @@ const TOOLS = [
     }
   },
   {
+    name: "toy_heat",
+    description: "开关加热。打开后到时间自动关（默认 15 分钟，最多 30 分钟）。toy_stop 也会关掉加热",
+    inputSchema: {
+      type: "object",
+      properties: {
+        on: { type: "boolean", description: "true 开，false 关" },
+        minutes: { type: "number", description: "开多久后自动关，默认 15，最多 30" },
+        idx: { type: "number", description: "加热通道号，默认 2。只有默认值不生效时才改，用来实测" }
+      },
+      required: ["on"]
+    }
+  },
+  {
     name: "toy_raw",
-    description: "调试用：直接发一条原始 BLE 指令（十六进制，空格分隔），用来实测新指令格式。只允许 55 开头、6-8 字节、指令号 03/04/08/09。默认 sec 秒后自动停",
+    description: "调试用：直接发一条原始 BLE 指令（十六进制，空格分隔），用来实测新指令格式。只允许 55 开头、6-8 字节、指令号 03/04/05/08/09。默认 sec 秒后自动停",
     inputSchema: {
       type: "object",
       properties: {
@@ -214,7 +250,7 @@ const TOOLS = [
   },
   {
     name: "toy_stop",
-    description: "立即停止",
+    description: "立即停止所有功能（包括加热）",
     inputSchema: { type: "object", properties: {} }
   },
   {
@@ -352,12 +388,21 @@ function callTool(name, args) {
       pushCmd({ type: "stretch", mode, level, sec: Number(args.sec) || 0 });
       return text(`已设置伸缩模式 ${mode}，强度 ${level}`);
     }
+    case "toy_heat": {
+      const idx = clamp(Math.round(Number(args.idx ?? 2)), 0, 255);
+      if (args.on) {
+        const min = setHeat(true, idx, args.minutes);
+        return text(`已打开加热（通道 ${idx}），${min} 分钟后自动关`);
+      }
+      setHeat(false, idx);
+      return text("已关闭加热");
+    }
     case "toy_raw": {
       const parts = String(args.hex || "").trim().split(/[\s,]+/);
       const bytes = parts.map((h) => parseInt(h, 16));
       if (bytes.length < 6 || bytes.length > 8 || bytes.some((b) => !(b >= 0 && b <= 255)) ||
-          bytes[0] !== 0x55 || ![3, 4, 8, 9].includes(bytes[1])) {
-        throw new Error("只允许 55 开头、6-8 字节、指令号 03/04/08/09 的指令");
+          bytes[0] !== 0x55 || ![3, 4, 5, 8, 9].includes(bytes[1])) {
+        throw new Error("只允许 55 开头、6-8 字节、指令号 03/04/05/08/09 的指令");
       }
       cancelSeq();
       const hex = bytes.map((b) => b.toString(16).padStart(2, "0")).join(" ");
@@ -368,10 +413,12 @@ function callTool(name, args) {
       cancelSeq();
       currentCmd = { type: "stop" };
       lastUpdate = Date.now();
+      if (heat.on) { setHeat(false, heat.idx); return text("已停止，加热也已关闭"); }
       return text("已停止");
     case "toy_status": {
       const ago = lastPoll ? Math.round((Date.now() - lastPoll) / 1000) : null;
       const online = ago !== null && ago < 5;
+      const heatInfo = heat.on ? `\n加热开着，还有约 ${Math.ceil((heat.until - Date.now()) / 60000)} 分钟自动关` : "";
       const seqInfo = seq ? `\n正在运行序列「${seq.name}」：第 ${seq.round + 1} 轮，第 ${seq.idx}/${seq.steps.length} 步` : "";
       return text((
         online
@@ -379,7 +426,7 @@ function callTool(name, args) {
           : ago === null
             ? "中继离线：服务启动后还没有中继来轮询"
             : `中继离线：最后一次轮询在 ${ago} 秒前`
-      ) + seqInfo);
+      ) + seqInfo + heatInfo);
     }
     case "toy_sequence": {
       const loop = args.loop ?? false;
@@ -434,7 +481,7 @@ function handleRpc(msg) {
       return ok({
         protocolVersion: PROTOCOL_VERSIONS.includes(wanted) ? wanted : PROTOCOL_VERSIONS[0],
         capabilities: { tools: {} },
-        serverInfo: { name: "svakom-bridge", version: "1.5.0" }
+        serverInfo: { name: "svakom-bridge", version: "1.6.0" }
       });
     }
     case "ping":
