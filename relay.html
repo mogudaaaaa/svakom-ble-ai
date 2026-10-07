@@ -163,7 +163,8 @@ async function execCmd(c) {
   // 兼容服务器的 {type:"stop"} 和旧格式 {stop:true}
   if (c.type === "stop" || c.stop) {
     await stopNow("停止");
-    await write(cmdHeat(false, heatIdx), "all");
+    // 两个设备的加热通道可能不同（吸头 1），都关一遍
+    for (const i of new Set([1, 2, heatIdx])) await write(cmdHeat(false, i), "all");
     return;
   }
 

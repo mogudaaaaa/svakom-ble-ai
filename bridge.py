@@ -128,7 +128,11 @@ async def exec_cmd(c: dict):
     global current_cmd, current_until, heat_idx
     t = c.get("type")
     if c.get("stop") or t == "stop":
-        await stop_all(); await write(cmd_heat(False, heat_idx), "all"); log("⏹ 停止"); return
+        await stop_all()
+        # 两个设备的加热通道可能不同（吸头 1），都关一遍
+        for i in {1, 2, heat_idx}:
+            await write(cmd_heat(False, i), "all")
+        log("⏹ 停止"); return
 
     if t == "heat":
         # 加热：只发一次，不进续命，也不影响正在跑的震动/吮吸

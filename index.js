@@ -41,11 +41,14 @@ const heat = {
   sucker: { on: false, idx: 2, until: 0, timer: null }
 };
 const HEAT_NAME = { body: "主体", sucker: "吸头" };
+// 实测：吸头加热通道是 1；主体还没测，先用 2
+const HEAT_IDX = { body: 2, sucker: 1 };
 
-function setHeat(target, on, idx, minutes) {
+function setHeat(target, on, idxOverride, minutes) {
   const parts = target === "body" || target === "sucker" ? [target] : ["body", "sucker"];
   let min = 0;
   for (const t of parts) {
+    const idx = idxOverride ?? HEAT_IDX[t];
     if (heat[t].timer) clearTimeout(heat[t].timer);
     heat[t] = { on, idx, until: 0, timer: null };
     if (on) {
@@ -53,8 +56,9 @@ function setHeat(target, on, idx, minutes) {
       heat[t].until = Date.now() + min * 60000;
       heat[t].timer = setTimeout(() => setHeat(t, false, idx), min * 60000);
     }
+    // 每个设备通道号可能不同，所以分开发
+    heatQueue.push({ type: "heat", on, idx, target: t, at: Date.now() });
   }
-  heatQueue.push({ type: "heat", on, idx, target: parts.length === 2 ? "both" : parts[0], at: Date.now() });
   return min;
 }
 const anyHeat = () => heat.body.on || heat.sucker.on;
@@ -239,7 +243,7 @@ const TOOLS = [
         on: { type: "boolean", description: "true 开，false 关" },
         target: { type: "string", enum: ["body", "sucker", "both"], description: "body = 主体，sucker = 吸头，both = 两个，默认 both" },
         minutes: { type: "number", description: "开多久后自动关，默认 15，最多 30" },
-        idx: { type: "number", description: "加热通道号，默认 2。只有默认值不生效时才改，用来实测" }
+        idx: { type: "number", description: "加热通道号，一般不填（吸头默认 1，已实测；主体默认 2，待实测）。只在调试时填" }
       },
       required: ["on"]
     }
@@ -397,12 +401,12 @@ function callTool(name, args) {
       return text(`已设置伸缩模式 ${mode}，强度 ${level}`);
     }
     case "toy_heat": {
-      const idx = clamp(Math.round(Number(args.idx ?? 2)), 0, 255);
+      const idx = args.idx === undefined ? undefined : clamp(Math.round(Number(args.idx)), 0, 255);
       const target = args.target === "body" || args.target === "sucker" ? args.target : "both";
       const where = target === "both" ? "主体和吸头" : HEAT_NAME[target];
       if (args.on) {
         const min = setHeat(target, true, idx, args.minutes);
-        return text(`已打开${where}加热（通道 ${idx}），${min} 分钟后自动关`);
+        return text(`已打开${where}加热，${min} 分钟后自动关`);
       }
       setHeat(target, false, idx);
       return text(`已关闭${where}加热`);
@@ -423,7 +427,7 @@ function callTool(name, args) {
       cancelSeq();
       currentCmd = { type: "stop" };
       lastUpdate = Date.now();
-      if (anyHeat()) { setHeat("both", false, heat.body.idx); return text("已停止，加热也已关闭"); }
+      if (anyHeat()) { setHeat("both", false); return text("已停止，加热也已关闭"); }
       return text("已停止");
     case "toy_status": {
       const ago = lastPoll ? Math.round((Date.now() - lastPoll) / 1000) : null;
