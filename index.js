@@ -178,11 +178,11 @@ const TOOLS = [
   },
   {
     name: "toy_suck",
-    description: "设置吸头的吮吸模式和强度。模式：1=连续，2=间隔+断续一下，3=间隔连续，4=只断续，5=断续与连续交替。强度低于 0.5 时模式差别不明显",
+    description: "设置吸头的吮吸模式和强度。模式：1=连续，2=间隔+断续一下，3=间隔连续，4=断续与连续交替，5=只断续。强度低于 0.5 时模式差别不明显",
     inputSchema: {
       type: "object",
       properties: {
-        mode: { type: "number", description: "吮吸模式 1-5（1=连续，2=间隔+断续一下，3=间隔连续，4=只断续，5=断续与连续交替），默认 1" },
+        mode: { type: "number", description: "吮吸模式 1-5（1=连续，2=间隔+断续一下，3=间隔连续，4=断续与连续交替，5=只断续），默认 1" },
         level: { type: "number", description: "强度 0-1，默认 0.6" },
         sec: { type: "number", description: "持续秒数，可选" }
       }
@@ -237,7 +237,7 @@ const TOOLS = [
             properties: {
               speed: { type: "number", description: "强度 0-1；0 = 停顿" },
               pattern: { type: "number", description: "主体震动花样 1-10" },
-              suck: { type: "number", description: "吸头吮吸模式 1-5（1=连续，2=间隔+断续一下，3=间隔连续，4=只断续，5=断续与连续交替），配 level" },
+              suck: { type: "number", description: "吸头吮吸模式 1-5（1=连续，2=间隔+断续一下，3=间隔连续，4=断续与连续交替，5=只断续），配 level" },
               stretch: { type: "number", description: "主体伸缩模式 1-7（配 level）" },
               level: { type: "number", description: "花样强度 0-1" },
               sec: { type: "number", description: "这一步持续秒数" }
@@ -279,7 +279,7 @@ const TOOLS = [
             properties: {
               speed: { type: "number", description: "强度 0-1；0 = 停顿" },
               pattern: { type: "number", description: "主体震动花样 1-10" },
-              suck: { type: "number", description: "吸头吮吸模式 1-5（1=连续，2=间隔+断续一下，3=间隔连续，4=只断续，5=断续与连续交替），配 level" },
+              suck: { type: "number", description: "吸头吮吸模式 1-5（1=连续，2=间隔+断续一下，3=间隔连续，4=断续与连续交替，5=只断续），配 level" },
               stretch: { type: "number", description: "主体伸缩模式 1-7（配 level）" },
               level: { type: "number", description: "花样强度 0-1" },
               sec: { type: "number", description: "这一步持续秒数" }

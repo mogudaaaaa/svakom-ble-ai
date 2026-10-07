@@ -174,8 +174,15 @@ async function execCmd(c) {
     if (!(level01 > 0)) return stopNow("强度 0");
     const lvl = clampB(level01 * 10, 1, 10);
     // 切换到别的功能时，先关掉之前在跑的那个，避免两个叠在一起
-    if (currentBuf && currentBuf[1] !== FUNCS[func].no) await stopNow("切换功能");
-    currentBuf = cmdFunc(func, mode, lvl);
+    const next = cmdFunc(func, mode, lvl);
+    if (currentBuf && currentBuf[1] !== next[1]) await stopNow("切换功能");
+    // 同一功能换模式时，设备要先关掉才认新模式（只换强度不用）
+    else if (currentBuf && currentBuf[4] !== next[4]) {
+      currentBuf = null;
+      await write(cmdFuncOff(func));
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    currentBuf = next;
     currentUntil = durationUntil(c);
     await write(currentBuf);
     const names = { vibrate: "🌀 震动花样", stretch: "↕️ 伸缩模式", suck: "💨 吮吸模式" };

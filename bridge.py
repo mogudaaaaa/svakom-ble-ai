@@ -119,6 +119,11 @@ async def exec_cmd(c: dict):
         mode = int(c.get("pattern" if func == "vibrate" else "mode", 1) or 1)
         buf = cmd_func(func, mode, lv * 10)
         await switch_to(buf)
+        # 同一功能换模式时，设备要先关掉才认新模式（只换强度不用）
+        if current_cmd is not None and current_cmd[1] == buf[1] and current_cmd[4] != buf[4]:
+            current_cmd = None
+            await write(cmd_func_off(func))
+            await asyncio.sleep(0.2)
         current_cmd = buf; current_until = parse_duration(c)
         await write(buf)
         name = {"vibrate": "🌀 震动花样", "stretch": "↕️ 伸缩模式", "suck": "💨 吮吸模式"}[func]
