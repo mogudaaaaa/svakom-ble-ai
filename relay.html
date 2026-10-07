@@ -42,9 +42,11 @@
     <input id="url" inputmode="url" autocomplete="off" placeholder="https://xxx.up.railway.app">
     <label for="secret">Secret</label>
     <input id="secret" type="password" autocomplete="off" placeholder="BRIDGE_SECRET">
-    <button id="connect">连接设备并开始中继</button>
-    <button class="secondary" id="addDev">再连一个设备（吸头 / 主体）</button>
-    <p class="hint">SL278K 是两个蓝牙设备：主体（震动 + 伸缩）和吸头（吮吸）。弹窗里两个都叫 SL278K，连完一个再点「再连一个设备」选另一个。</p>
+    <div class="row">
+      <button id="connectBody">连接主体</button>
+      <button id="connectSucker">连接吸头</button>
+    </div>
+    <p class="hint">SL278K 是两个蓝牙设备：主体（震动 + 伸缩 + 加热）和吸头（吮吸 + 加热）。弹窗里两个都叫 SL278K 分不出来，所以<b>连哪个就先只开哪个</b>：只开主体 → 点「连接主体」；再开吸头 → 点「连接吸头」。连上第一个就开始中继。</p>
   </div>
 
   <div class="card status">
@@ -120,12 +122,19 @@ const INIT_SEQ = [
 ].map((a) => new Uint8Array(a));
 
 let writing = Promise.resolve();
-function write(buf) {
+// 指令发给谁：吮吸 → 吸头；震动/伸缩 → 主体；整体强度、停止 → 全部；加热按指定
+function routeOf(buf) {
+  if (buf[1] === 9) return "sucker";
+  if (buf[1] === 3 || buf[1] === 8) return "body";
+  return "all";
+}
+function write(buf, target) {
+  const to = target || routeOf(buf);
   // 串行写入，避免 "GATT operation already in progress"
-  // 广播给所有已连接的设备：每个设备只响应自己支持的指令，其他的会忽略
   writing = writing.then(async () => {
     for (const d of devs) {
       if (!d.writeChar) continue;
+      if (to !== "all" && d.role !== to) continue;
       try {
         if (d.writeChar.writeValueWithoutResponse) await d.writeChar.writeValueWithoutResponse(buf);
         else await d.writeChar.writeValue(buf);
@@ -145,8 +154,8 @@ function durationUntil(c) {
 
 async function stopNow(reason) {
   currentBuf = null; currentUntil = 0;
-  await write(cmdScaleStop());
-  for (const f of Object.keys(FUNCS)) await write(cmdFuncOff(f));
+  await write(cmdScaleStop(), "all");
+  for (const f of Object.keys(FUNCS)) await write(cmdFuncOff(f), "all");
   log("⏹ " + reason);
 }
 
@@ -154,15 +163,18 @@ async function execCmd(c) {
   // 兼容服务器的 {type:"stop"} 和旧格式 {stop:true}
   if (c.type === "stop" || c.stop) {
     await stopNow("停止");
-    await write(cmdHeat(false, heatIdx));
+    await write(cmdHeat(false, heatIdx), "all");
     return;
   }
 
   // 加热：只发一次，不进续命，也不影响正在跑的震动/吮吸
   if (c.type === "heat") {
     heatIdx = clampB(Number(c.idx ?? 2), 0, 255);
-    await write(cmdHeat(!!c.on, heatIdx));
-    return log(c.on ? `🔥 加热开（通道 ${heatIdx}）` : "❄️ 加热关");
+    const to = c.target === "body" || c.target === "sucker" ? c.target : "all";
+    const where = { body: "主体", sucker: "吸头", all: "主体 + 吸头" }[to];
+    if (to !== "all" && !devs.some((d) => d.role === to && d.writeChar)) log(`⚠️ ${where}没连上，加热指令发不出去`);
+    await write(cmdHeat(!!c.on, heatIdx), to);
+    return log(c.on ? `🔥 ${where}加热开（通道 ${heatIdx}）` : `❄️ ${where}加热关`);
   }
 
   // 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/5/8/9（都走 FFE1 控制通道）
@@ -174,7 +186,7 @@ async function execCmd(c) {
     }
     currentBuf = new Uint8Array(bytes);
     currentUntil = durationUntil(c);
-    await write(currentBuf);
+    await write(currentBuf, "all");
     return log("🧪 原始指令 " + bytes.map((b) => b.toString(16).padStart(2, "0")).join(" "));
   }
 
@@ -254,13 +266,16 @@ async function onDisconnected(d) {
   log(`${d.label} 重连失败，请刷新页面重新连接`);
 }
 
-async function addDevice() {
+async function addDevice(role) {
   const device = await navigator.bluetooth.requestDevice({
     filters: [{ namePrefix: NAME_PREFIX }],
     optionalServices: [SERVICE],
   });
   if (devs.some((d) => d.device.id === device.id)) { log("这个设备已经连过了，请选另一个"); return; }
-  const d = { device, writeChar: null, label: `${device.name || "设备"}#${devs.length + 1}` };
+  // 同一个角色只保留一个：重新连接主体/吸头时替换掉旧的
+  const old = devs.find((d) => d.role === role);
+  if (old) { try { old.device.gatt.disconnect(); } catch (e) {} devs = devs.filter((d) => d !== old); }
+  const d = { device, writeChar: null, role, label: role === "body" ? "主体" : "吸头" };
   devs.push(d);
   device.addEventListener("gattserverdisconnected", () => onDisconnected(d));
   await connectGatt(d);
@@ -312,7 +327,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 // ---------- 按钮 ----------
-$("connect").onclick = async () => {
+async function connectRole(role) {
   if (!navigator.bluetooth) {
     log("❌ 当前浏览器不支持 Web Bluetooth，请用安卓 Chrome / Edge，并确认是 https 页面");
     return;
@@ -322,24 +337,21 @@ $("connect").onclick = async () => {
     localStorage.setItem("relay_url", baseUrl());
     localStorage.setItem("relay_secret", $("secret").value);
   } catch (e) {}
-
-  $("connect").disabled = true;
+  const btn = $(role === "body" ? "connectBody" : "connectSucker");
+  btn.disabled = true;
   try {
-    if (!devs.length) await addDevice();
+    await addDevice(role);
     keepAwake();
     pollLoop();
-    $("connect").textContent = "已在中继";
+    btn.textContent = (role === "body" ? "主体" : "吸头") + "已连接（点击重连）";
   } catch (e) {
     log("连接失败：" + e.message);
     bleStatus();
-    $("connect").disabled = false;
   }
-};
-
-$("addDev").onclick = async () => {
-  if (!navigator.bluetooth) return log("❌ 当前浏览器不支持 Web Bluetooth");
-  try { await addDevice(); } catch (e) { log("连接失败：" + e.message); bleStatus(); }
-};
+  btn.disabled = false;
+}
+$("connectBody").onclick = () => connectRole("body");
+$("connectSucker").onclick = () => connectRole("sucker");
 $("test").onclick = () => execCmd({ speed: 0.2, sec: 2 });
 $("stop").onclick = () => stopNow("手动停止");
 </script>

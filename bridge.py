@@ -29,7 +29,7 @@ BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")
 
 current_cmd = None
 current_until = 0
-clients = {}  # address -> BleakClient
+clients = {}  # address -> (BleakClient, role)；role 是 "body" / "sucker" / "unknown"
 
 # 震动 55 03 / 伸缩 55 08 / 吮吸 55 09：00 00 <模式> <强度 1-10> 00
 FUNCS = {"vibrate": (3, 10), "stretch": (8, 7), "suck": (9, 5)}
@@ -79,8 +79,30 @@ def parse_duration(c):
     return 0
 
 
-async def write(buf):
-    for addr, cl in list(clients.items()):
+def route_of(buf):
+    """吮吸 → 吸头；震动/伸缩 → 主体；整体强度、停止 → 全部"""
+    if buf[1] == 9: return "sucker"
+    if buf[1] in (3, 8): return "body"
+    return "all"
+
+
+def role_from_adv(adv):
+    """从广播的厂商数据里认设备：产品编号 128 = 主体，129 = 吸头"""
+    try:
+        for data in (adv.manufacturer_data or {}).values():
+            if 0x80 in data and 0x81 not in data: return "body"
+            if 0x81 in data and 0x80 not in data: return "sucker"
+    except Exception:
+        pass
+    return "unknown"
+
+
+async def write(buf, target=None):
+    to = target or route_of(buf)
+    for addr, (cl, role) in list(clients.items()):
+        # 认不出角色的设备什么都收，保证至少能用
+        if to != "all" and role not in (to, "unknown"):
+            continue
         if cl.is_connected:
             try:
                 await cl.write_gatt_char(WRITE_UUID, buf, response=False)
@@ -91,9 +113,9 @@ async def write(buf):
 async def stop_all():
     global current_cmd, current_until
     current_cmd = None; current_until = 0
-    await write(cmd_scale_stop())
+    await write(cmd_scale_stop(), "all")
     for f in FUNCS:
-        await write(cmd_func_off(f))
+        await write(cmd_func_off(f), "all")
 
 
 async def switch_to(buf):
@@ -106,14 +128,16 @@ async def exec_cmd(c: dict):
     global current_cmd, current_until, heat_idx
     t = c.get("type")
     if c.get("stop") or t == "stop":
-        await stop_all(); await write(cmd_heat(False, heat_idx)); log("⏹ 停止"); return
+        await stop_all(); await write(cmd_heat(False, heat_idx), "all"); log("⏹ 停止"); return
 
     if t == "heat":
         # 加热：只发一次，不进续命，也不影响正在跑的震动/吮吸
         heat_idx = clampb(float(c.get("idx", 2)), 0, 255)
         on = bool(c.get("on"))
-        await write(cmd_heat(on, heat_idx))
-        log(f"🔥 加热开（通道 {heat_idx}）" if on else "❄️ 加热关"); return
+        to = c.get("target") if c.get("target") in ("body", "sucker") else "all"
+        where = {"body": "主体", "sucker": "吸头", "all": "主体 + 吸头"}[to]
+        await write(cmd_heat(on, heat_idx), to)
+        log(f"🔥 {where}加热开（通道 {heat_idx}）" if on else f"❄️ {where}加热关"); return
 
     if t == "raw":
         # 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/5/8/9（都走 FFE1 控制通道）
@@ -124,7 +148,7 @@ async def exec_cmd(c: dict):
         if not (6 <= len(b) <= 8 and b[0] == 0x55 and b[1] in (3, 4, 5, 8, 9)):
             log(f"🚫 拒绝原始指令：{c.get('hex')}"); return
         current_cmd = b; current_until = parse_duration(c)
-        await write(b); log(f"🧪 原始指令 {b.hex(' ')}"); return
+        await write(b, "all"); log(f"🧪 原始指令 {b.hex(' ')}"); return
 
     func = "vibrate" if (t == "pattern" or "pattern" in c) else t if t in ("suck", "stretch") else None
     if func:
@@ -180,11 +204,11 @@ async def bridge_loop():
         await asyncio.sleep(POLL_SEC)
 
 
-async def hold_device(dev):
+async def hold_device(dev, role):
     """连上一个设备、发初始化握手，断开后从列表移除，由扫描循环重新发现"""
     try:
         async with BleakClient(dev) as cl:
-            clients[dev.address] = cl
+            clients[dev.address] = (cl, role)
             await asyncio.sleep(0.24)
             for buf in INIT_SEQ:
                 await cl.write_gatt_char(WRITE_UUID, buf, response=False)
@@ -193,7 +217,8 @@ async def hold_device(dev):
                 await cl.start_notify(NOTIFY_UUID, lambda s, d: None)
             except Exception:
                 pass
-            log(f"🎉 {dev.name}（{dev.address}）就绪，当前已连 {len(clients)} 个设备")
+            name = {"body": "主体", "sucker": "吸头", "unknown": "未识别设备（所有指令都发）"}[role]
+            log(f"🎉 {dev.name} {name}（{dev.address}）就绪，当前已连 {len(clients)} 个设备")
             while cl.is_connected:
                 await asyncio.sleep(1)
     except Exception as e:
@@ -205,12 +230,13 @@ async def hold_device(dev):
 async def ble_loop():
     holding = set()
     while True:
-        devs = await BleakScanner.discover(timeout=5.0)
-        for d in devs:
+        found = await BleakScanner.discover(timeout=5.0, return_adv=True)
+        for d, adv in found.values():
             if d.name and NAME_KEY in d.name and d.address not in holding:
                 holding.add(d.address)
-                log(f"🔗 连接 {d.name}（{d.address}）...")
-                task = asyncio.create_task(hold_device(d))
+                role = role_from_adv(adv)
+                log(f"🔗 连接 {d.name}（{d.address}，{role}）...")
+                task = asyncio.create_task(hold_device(d, role))
                 task.add_done_callback(lambda _t, a=d.address: holding.discard(a))
         if not holding:
             log("⚠️ 没找到设备，继续扫描…")

@@ -33,23 +33,31 @@ function pushCmd(cmd) {
   lastUpdate = Date.now();
 }
 
-// 加热单独一个槽位，不会被震动/吮吸指令覆盖掉
-let pendingHeat = null;
-let heat = { on: false, idx: 2, until: 0, timer: null };
+// 加热单独一个队列，不会被震动/吮吸指令覆盖掉；主体和吸头分开计时
+const heatQueue = [];
 const HEAT_MAX_MIN = 30;
+const heat = {
+  body: { on: false, idx: 2, until: 0, timer: null },
+  sucker: { on: false, idx: 2, until: 0, timer: null }
+};
+const HEAT_NAME = { body: "主体", sucker: "吸头" };
 
-function setHeat(on, idx, minutes) {
-  if (heat.timer) clearTimeout(heat.timer);
-  heat = { on, idx, until: 0, timer: null };
-  pendingHeat = { type: "heat", on, idx, at: Date.now() };
-  if (on) {
-    const min = clamp(Number(minutes) || 15, 1, HEAT_MAX_MIN);
-    heat.until = Date.now() + min * 60000;
-    heat.timer = setTimeout(() => setHeat(false, idx), min * 60000);
-    return min;
+function setHeat(target, on, idx, minutes) {
+  const parts = target === "body" || target === "sucker" ? [target] : ["body", "sucker"];
+  let min = 0;
+  for (const t of parts) {
+    if (heat[t].timer) clearTimeout(heat[t].timer);
+    heat[t] = { on, idx, until: 0, timer: null };
+    if (on) {
+      min = clamp(Number(minutes) || 15, 1, HEAT_MAX_MIN);
+      heat[t].until = Date.now() + min * 60000;
+      heat[t].timer = setTimeout(() => setHeat(t, false, idx), min * 60000);
+    }
   }
-  return 0;
+  heatQueue.push({ type: "heat", on, idx, target: parts.length === 2 ? "both" : parts[0], at: Date.now() });
+  return min;
 }
+const anyHeat = () => heat.body.on || heat.sucker.on;
 
 // ---------------- 节奏序列（服务器按时间一步步切换指令） ----------------
 
@@ -152,10 +160,9 @@ function checkSecret(req, res, next) {
 // 中继轮询：获取下一条指令
 app.get("/toy-next", checkSecret, (req, res) => {
   lastPoll = Date.now();
-  if (pendingHeat) {
-    const h = pendingHeat;
-    pendingHeat = null;
-    if (Date.now() - h.at < 60000) return res.json({ type: "heat", on: h.on, idx: h.idx });
+  while (heatQueue.length) {
+    const h = heatQueue.shift();
+    if (Date.now() - h.at < 60000) return res.json({ type: "heat", on: h.on, idx: h.idx, target: h.target });
   }
   if (currentCmd && Date.now() - lastUpdate < 15000) {
     const cmd = currentCmd;
@@ -225,11 +232,12 @@ const TOOLS = [
   },
   {
     name: "toy_heat",
-    description: "开关加热。打开后到时间自动关（默认 15 分钟，最多 30 分钟）。toy_stop 也会关掉加热",
+    description: "开关加热。主体和吸头各有一个加热，可以分开开关。打开后到时间自动关（默认 15 分钟，最多 30 分钟）。toy_stop 会关掉所有加热",
     inputSchema: {
       type: "object",
       properties: {
         on: { type: "boolean", description: "true 开，false 关" },
+        target: { type: "string", enum: ["body", "sucker", "both"], description: "body = 主体，sucker = 吸头，both = 两个，默认 both" },
         minutes: { type: "number", description: "开多久后自动关，默认 15，最多 30" },
         idx: { type: "number", description: "加热通道号，默认 2。只有默认值不生效时才改，用来实测" }
       },
@@ -390,12 +398,14 @@ function callTool(name, args) {
     }
     case "toy_heat": {
       const idx = clamp(Math.round(Number(args.idx ?? 2)), 0, 255);
+      const target = args.target === "body" || args.target === "sucker" ? args.target : "both";
+      const where = target === "both" ? "主体和吸头" : HEAT_NAME[target];
       if (args.on) {
-        const min = setHeat(true, idx, args.minutes);
-        return text(`已打开加热（通道 ${idx}），${min} 分钟后自动关`);
+        const min = setHeat(target, true, idx, args.minutes);
+        return text(`已打开${where}加热（通道 ${idx}），${min} 分钟后自动关`);
       }
-      setHeat(false, idx);
-      return text("已关闭加热");
+      setHeat(target, false, idx);
+      return text(`已关闭${where}加热`);
     }
     case "toy_raw": {
       const parts = String(args.hex || "").trim().split(/[\s,]+/);
@@ -413,12 +423,13 @@ function callTool(name, args) {
       cancelSeq();
       currentCmd = { type: "stop" };
       lastUpdate = Date.now();
-      if (heat.on) { setHeat(false, heat.idx); return text("已停止，加热也已关闭"); }
+      if (anyHeat()) { setHeat("both", false, heat.body.idx); return text("已停止，加热也已关闭"); }
       return text("已停止");
     case "toy_status": {
       const ago = lastPoll ? Math.round((Date.now() - lastPoll) / 1000) : null;
       const online = ago !== null && ago < 5;
-      const heatInfo = heat.on ? `\n加热开着，还有约 ${Math.ceil((heat.until - Date.now()) / 60000)} 分钟自动关` : "";
+      const heatInfo = ["body", "sucker"].filter((t) => heat[t].on)
+        .map((t) => `\n${HEAT_NAME[t]}加热开着，还有约 ${Math.ceil((heat[t].until - Date.now()) / 60000)} 分钟自动关`).join("");
       const seqInfo = seq ? `\n正在运行序列「${seq.name}」：第 ${seq.round + 1} 轮，第 ${seq.idx}/${seq.steps.length} 步` : "";
       return text((
         online
@@ -481,7 +492,7 @@ function handleRpc(msg) {
       return ok({
         protocolVersion: PROTOCOL_VERSIONS.includes(wanted) ? wanted : PROTOCOL_VERSIONS[0],
         capabilities: { tools: {} },
-        serverInfo: { name: "svakom-bridge", version: "1.6.0" }
+        serverInfo: { name: "svakom-bridge", version: "1.7.0" }
       });
     }
     case "ping":
