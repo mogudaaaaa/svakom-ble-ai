@@ -46,10 +46,18 @@ const presets = new Map(); // 内存保存，服务重启会清空
 function normalizeStep(st) {
   const sec = clamp(Number(st.sec) || 0, MIN_STEP_SEC, 600);
   if (st.stop || st.speed === 0) return { kind: "pause", sec };
+  if (st.stretch !== undefined) {
+    return {
+      kind: "stretch",
+      mode: clamp(Math.round(Number(st.stretch) || 1), 1, 7),
+      level: clamp(Number(st.level ?? 0.6), 0, 1),
+      sec
+    };
+  }
   if (st.suck !== undefined) {
     return {
       kind: "suck",
-      mode: clamp(Math.round(Number(st.suck) || 1), 1, 10),
+      mode: clamp(Math.round(Number(st.suck) || 1), 1, 5),
       level: clamp(Number(st.level ?? 0.6), 0, 1),
       sec
     };
@@ -57,7 +65,7 @@ function normalizeStep(st) {
   if (st.pattern !== undefined) {
     return {
       kind: "pattern",
-      pattern: clamp(Math.round(Number(st.pattern) || 1), 1, 8),
+      pattern: clamp(Math.round(Number(st.pattern) || 1), 1, 10),
       level: clamp(Number(st.level ?? 0.7), 0, 1),
       sec
     };
@@ -67,6 +75,7 @@ function normalizeStep(st) {
 
 function stepToCmd(st) {
   if (st.kind === "pause") return { type: "stop" };
+  if (st.kind === "stretch") return { type: "stretch", mode: st.mode, level: st.level };
   if (st.kind === "suck") return { type: "suck", mode: st.mode, level: st.level };
   if (st.kind === "pattern") return { type: "pattern", pattern: st.pattern, level: st.level };
   return { type: "speed", speed: st.speed };
@@ -145,7 +154,7 @@ app.post("/toy", checkSecret, (req, res) => {
 const TOOLS = [
   {
     name: "toy_set_speed",
-    description: "设置强度 (0.0-1.0)",
+    description: "设置整体强度 (0.0-1.0)，不区分功能",
     inputSchema: {
       type: "object",
       properties: {
@@ -157,11 +166,11 @@ const TOOLS = [
   },
   {
     name: "toy_set_pattern",
-    description: "设置振动花样",
+    description: "设置主体的震动花样（10 种）和强度",
     inputSchema: {
       type: "object",
       properties: {
-        pattern: { type: "number", description: "1-8" },
+        pattern: { type: "number", description: "震动花样 1-10" },
         level: { type: "number", description: "0.0-1.0" }
       },
       required: ["pattern"]
@@ -169,11 +178,23 @@ const TOOLS = [
   },
   {
     name: "toy_suck",
-    description: "设置吮吸款的吮吸模式和强度（指令 0x09）。模式 1 通常是持续吮吸，其他模式需要实测",
+    description: "设置吸头的吮吸模式（5 种）和强度",
     inputSchema: {
       type: "object",
       properties: {
-        mode: { type: "number", description: "吮吸模式 1-10，默认 1" },
+        mode: { type: "number", description: "吮吸模式 1-5，默认 1" },
+        level: { type: "number", description: "强度 0-1，默认 0.6" },
+        sec: { type: "number", description: "持续秒数，可选" }
+      }
+    }
+  },
+  {
+    name: "toy_stretch",
+    description: "设置主体的伸缩模式（7 种）和强度",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mode: { type: "number", description: "伸缩模式 1-7，默认 1" },
         level: { type: "number", description: "强度 0-1，默认 0.6" },
         sec: { type: "number", description: "持续秒数，可选" }
       }
@@ -210,13 +231,14 @@ const TOOLS = [
         name: { type: "string", description: "给这段节奏起个名字，可选" },
         steps: {
           type: "array",
-          description: "按顺序执行的步骤。每步填 speed（0-1，强度）、pattern（1-8，震动棒花样，配 level 0-1）或 suck（1-10，吮吸模式，配 level 0-1），再填 sec（这一步持续几秒，最少 0.5）。speed 为 0 表示停顿。最多 60 步。",
+          description: "按顺序执行的步骤。每步填一种：speed（0-1，整体强度）、pattern（1-10，主体震动花样）、stretch（1-7，主体伸缩模式）或 suck（1-5，吸头吮吸模式），后三种配 level 0-1，再填 sec（这一步持续几秒，最少 0.5）。speed 为 0 表示停顿。最多 60 步。",
           items: {
             type: "object",
             properties: {
               speed: { type: "number", description: "强度 0-1；0 = 停顿" },
-              pattern: { type: "number", description: "振动花样 1-8（仅震动棒）" },
-              suck: { type: "number", description: "吮吸模式 1-10（仅吮吸款，配 level）" },
+              pattern: { type: "number", description: "主体震动花样 1-10" },
+              suck: { type: "number", description: "吸头吮吸模式 1-5（配 level）" },
+              stretch: { type: "number", description: "主体伸缩模式 1-7（配 level）" },
               level: { type: "number", description: "花样强度 0-1" },
               sec: { type: "number", description: "这一步持续秒数" }
             },
@@ -251,13 +273,14 @@ const TOOLS = [
         name: { type: "string" },
         steps: {
           type: "array",
-          description: "按顺序执行的步骤。每步填 speed（0-1，强度）、pattern（1-8，震动棒花样，配 level 0-1）或 suck（1-10，吮吸模式，配 level 0-1），再填 sec（这一步持续几秒，最少 0.5）。speed 为 0 表示停顿。最多 60 步。",
+          description: "按顺序执行的步骤。每步填一种：speed（0-1，整体强度）、pattern（1-10，主体震动花样）、stretch（1-7，主体伸缩模式）或 suck（1-5，吸头吮吸模式），后三种配 level 0-1，再填 sec（这一步持续几秒，最少 0.5）。speed 为 0 表示停顿。最多 60 步。",
           items: {
             type: "object",
             properties: {
               speed: { type: "number", description: "强度 0-1；0 = 停顿" },
-              pattern: { type: "number", description: "振动花样 1-8（仅震动棒）" },
-              suck: { type: "number", description: "吮吸模式 1-10（仅吮吸款，配 level）" },
+              pattern: { type: "number", description: "主体震动花样 1-10" },
+              suck: { type: "number", description: "吸头吮吸模式 1-5（配 level）" },
+              stretch: { type: "number", description: "主体伸缩模式 1-7（配 level）" },
               level: { type: "number", description: "花样强度 0-1" },
               sec: { type: "number", description: "这一步持续秒数" }
             },
@@ -310,17 +333,24 @@ function callTool(name, args) {
       cancelSeq();
       currentCmd = {
         type: "pattern",
-        pattern: Math.max(1, Math.min(8, Math.round(Number(args.pattern) || 1))),
+        pattern: Math.max(1, Math.min(10, Math.round(Number(args.pattern) || 1))),
         level: Math.max(0, Math.min(1, args.level ?? 0.7))
       };
       lastUpdate = Date.now();
       return text(`已设置花样 ${currentCmd.pattern}`);
     case "toy_suck": {
       cancelSeq();
-      const mode = clamp(Math.round(Number(args.mode) || 1), 1, 10);
+      const mode = clamp(Math.round(Number(args.mode) || 1), 1, 5);
       const level = clamp(Number(args.level ?? 0.6), 0, 1);
       pushCmd({ type: "suck", mode, level, sec: Number(args.sec) || 0 });
       return text(`已设置吮吸模式 ${mode}，强度 ${level}`);
+    }
+    case "toy_stretch": {
+      cancelSeq();
+      const mode = clamp(Math.round(Number(args.mode) || 1), 1, 7);
+      const level = clamp(Number(args.level ?? 0.6), 0, 1);
+      pushCmd({ type: "stretch", mode, level, sec: Number(args.sec) || 0 });
+      return text(`已设置伸缩模式 ${mode}，强度 ${level}`);
     }
     case "toy_raw": {
       const parts = String(args.hex || "").trim().split(/[\s,]+/);
@@ -404,7 +434,7 @@ function handleRpc(msg) {
       return ok({
         protocolVersion: PROTOCOL_VERSIONS.includes(wanted) ? wanted : PROTOCOL_VERSIONS[0],
         capabilities: { tools: {} },
-        serverInfo: { name: "svakom-bridge", version: "1.4.0" }
+        serverInfo: { name: "svakom-bridge", version: "1.5.0" }
       });
     }
     case "ping":

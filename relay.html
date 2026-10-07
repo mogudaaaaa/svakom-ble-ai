@@ -43,6 +43,8 @@
     <label for="secret">Secret</label>
     <input id="secret" type="password" autocomplete="off" placeholder="BRIDGE_SECRET">
     <button id="connect">连接设备并开始中继</button>
+    <button class="secondary" id="addDev">再连一个设备（吸头 / 主体）</button>
+    <p class="hint">SL278K 是两个蓝牙设备：主体（震动 + 伸缩）和吸头（吮吸）。弹窗里两个都叫 SL278K，连完一个再点「再连一个设备」选另一个。</p>
   </div>
 
   <div class="card status">
@@ -71,7 +73,7 @@ const POLL_MS = 300;
 const KEEPALIVE_MS = 1500;
 
 const $ = (id) => document.getElementById(id);
-let device = null, writeChar = null;
+let devs = []; // [{ device, writeChar }]
 let currentBuf = null, currentUntil = 0;
 let polling = false, wakeLock = null, pollFailCount = 0;
 
@@ -96,27 +98,36 @@ function baseUrl() {
   return $("url").value.trim().replace(/\/+$/, "").replace(/\/toy-next.*$/, "");
 }
 
-// ---------- 设备指令（与 bridge.py 相同） ----------
+// ---------- 设备指令（SL278K 逆向数据：discuss.buttplug.io/t/867） ----------
 const H = 0x55;
-const cmdScale = (v) => new Uint8Array([H, 4, 0, 0, 1, Math.max(0, Math.min(255, v)), 0xAA]);
-const cmdStop = () => new Uint8Array([H, 4, 0, 0, 0, 0, 0xAA]);
-const cmdVibrate = (mode, level) =>
-  new Uint8Array([H, 3, 0, 0, Math.max(1, Math.min(8, mode)), Math.max(1, Math.min(5, level)), 0]);
-// 吮吸：55 09 00 00 <模式> <强度 1-10>（格式来自 Buttplug 对同系列 SL278B 的抓包）
-const cmdSuck = (mode, level) =>
-  new Uint8Array([H, 9, 0, 0, Math.max(1, Math.min(10, mode)), Math.max(1, Math.min(10, level))]);
-const cmdSuckStop = () => new Uint8Array([H, 9, 0, 0, 0, 0]);
-const cmdVibrateStop = () => new Uint8Array([H, 3, 0, 0, 0, 0]);
+const clampB = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.round(v)));
+const cmdScale = (v) => new Uint8Array([H, 4, 0, 0, 1, clampB(v, 0, 255), 0xAA]);
+const cmdScaleStop = () => new Uint8Array([H, 4, 0, 0, 0, 0, 0xAA]);
+// 震动 55 03 / 伸缩 55 08 / 吮吸 55 09：00 00 <模式> <强度 1-10> 00
+const FUNCS = { vibrate: { no: 3, modes: 10 }, stretch: { no: 8, modes: 7 }, suck: { no: 9, modes: 5 } };
+const cmdFunc = (f, mode, level) =>
+  new Uint8Array([H, FUNCS[f].no, 0, 0, clampB(mode, 1, FUNCS[f].modes), clampB(level, 1, 10), 0]);
+const cmdFuncOff = (f) => new Uint8Array([H, FUNCS[f].no, 0, 0, 0, 0, 0]);
+// 官方 App 连上后约 240ms 发的初始化握手，没有它后面的指令不生效
+const INIT_SEQ = [
+  [H, 4, 0, 0, 1, 0xFF, 0xAA],
+  [H, 4, 0, 0, 0, 0, 0xAA],
+  [H, 4, 0, 0, 0, 0, 0xAA],
+  [H, 3, 0, 0, 0, 0, 0],
+].map((a) => new Uint8Array(a));
 
 let writing = Promise.resolve();
 function write(buf) {
   // 串行写入，避免 "GATT operation already in progress"
+  // 广播给所有已连接的设备：每个设备只响应自己支持的指令，其他的会忽略
   writing = writing.then(async () => {
-    if (!writeChar) return;
-    try {
-      if (writeChar.writeValueWithoutResponse) await writeChar.writeValueWithoutResponse(buf);
-      else await writeChar.writeValue(buf);
-    } catch (e) { log("写入失败：" + e.message); }
+    for (const d of devs) {
+      if (!d.writeChar) continue;
+      try {
+        if (d.writeChar.writeValueWithoutResponse) await d.writeChar.writeValueWithoutResponse(buf);
+        else await d.writeChar.writeValue(buf);
+      } catch (e) { log(`写入失败（${d.label}）：` + e.message); }
+    }
   });
   return writing;
 }
@@ -131,24 +142,14 @@ function durationUntil(c) {
 
 async function stopNow(reason) {
   currentBuf = null; currentUntil = 0;
-  await write(cmdStop());
-  await write(cmdSuckStop());
-  await write(cmdVibrateStop());
+  await write(cmdScaleStop());
+  for (const f of Object.keys(FUNCS)) await write(cmdFuncOff(f));
   log("⏹ " + reason);
 }
 
 async function execCmd(c) {
   // 兼容服务器的 {type:"stop"} 和旧格式 {stop:true}
   if (c.type === "stop" || c.stop) return stopNow("停止");
-
-  if (c.type === "pattern" || "pattern" in c) {
-    const mode = Math.round(Number(c.pattern) || 1);
-    const lvl = Math.max(1, Math.round((c.level ?? 0.6) * 5));
-    currentBuf = cmdVibrate(mode, lvl);
-    currentUntil = durationUntil(c);
-    await write(currentBuf);
-    return log(`🌀 花样 ${mode}，档位 ${lvl}`);
-  }
 
   // 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/8/9（都走 FFE1 控制通道）
   if (c.type === "raw") {
@@ -163,20 +164,29 @@ async function execCmd(c) {
     return log("🧪 原始指令 " + bytes.map((b) => b.toString(16).padStart(2, "0")).join(" "));
   }
 
-  if (c.type === "suck") {
-    const mode = Math.round(Number(c.mode) || 1);
-    const lvl = Math.max(1, Math.round((c.level ?? 0.6) * 10));
-    if (!((c.level ?? 0.6) > 0)) return stopNow("吮吸 0");
-    currentBuf = cmdSuck(mode, lvl);
+  // 震动花样 / 伸缩 / 吮吸：共用 <模式> <强度 1-10> 格式
+  const func = c.type === "pattern" || "pattern" in c ? "vibrate"
+             : c.type === "suck" ? "suck"
+             : c.type === "stretch" ? "stretch" : null;
+  if (func) {
+    const mode = Number(func === "vibrate" ? c.pattern : c.mode) || 1;
+    const level01 = Number(c.level ?? 0.6);
+    if (!(level01 > 0)) return stopNow("强度 0");
+    const lvl = clampB(level01 * 10, 1, 10);
+    // 切换到别的功能时，先关掉之前在跑的那个，避免两个叠在一起
+    if (currentBuf && currentBuf[1] !== FUNCS[func].no) await stopNow("切换功能");
+    currentBuf = cmdFunc(func, mode, lvl);
     currentUntil = durationUntil(c);
     await write(currentBuf);
-    return log(`💨 吮吸模式 ${mode}，强度 ${lvl}/10`);
+    const names = { vibrate: "🌀 震动花样", stretch: "↕️ 伸缩模式", suck: "💨 吮吸模式" };
+    return log(`${names[func]} ${currentBuf[4]}，强度 ${lvl}/10` + (currentUntil ? `，${c.sec}s 后停` : ""));
   }
 
   const val = c.speed ?? c.intensity;
   if (val !== undefined && val !== null) {
     const v = Number(val);
     if (!(v > 0)) return stopNow("强度 0");
+    if (currentBuf && currentBuf[1] !== 4) await stopNow("切换功能");
     currentBuf = cmdScale(Math.round(Math.min(1, v) * 255));
     currentUntil = durationUntil(c);
     await write(currentBuf);
@@ -191,25 +201,52 @@ setInterval(async () => {
   if (currentBuf) await write(currentBuf);
 }, KEEPALIVE_MS);
 
-// ---------- 蓝牙 ----------
-async function connectGatt() {
-  setStatus("Ble", "warn", "蓝牙：连接中…");
-  const server = await device.gatt.connect();
-  const svc = await server.getPrimaryService(SERVICE);
-  writeChar = await svc.getCharacteristic(WRITE_CHAR);
-  setStatus("Ble", "ok", `蓝牙：已连接 ${device.name || ""}`);
-  log("🎉 蓝牙就绪");
+// ---------- 蓝牙（支持同时连多个设备） ----------
+function bleStatus() {
+  const up = devs.filter((d) => d.writeChar);
+  if (!devs.length) return setStatus("Ble", "bad", "蓝牙：未连接");
+  setStatus("Ble", up.length === devs.length ? "ok" : "warn",
+    `蓝牙：已连接 ${up.length}/${devs.length} 个（${devs.map((d) => d.label + (d.writeChar ? "" : "×")).join("、")}）`);
 }
 
-async function onDisconnected() {
-  writeChar = null;
-  setStatus("Ble", "bad", "蓝牙：已断开，重连中…");
-  log("蓝牙断开，尝试重连");
-  for (let i = 0; i < 20 && device && !device.gatt.connected; i++) {
-    await new Promise((r) => setTimeout(r, 2000));
-    try { await connectGatt(); return; } catch (e) { log("重连失败：" + e.message); }
+async function connectGatt(d) {
+  setStatus("Ble", "warn", `蓝牙：连接 ${d.label} 中…`);
+  const server = await d.device.gatt.connect();
+  const svc = await server.getPrimaryService(SERVICE);
+  d.writeChar = await svc.getCharacteristic(WRITE_CHAR);
+  await new Promise((r) => setTimeout(r, 240));
+  for (const buf of INIT_SEQ) {
+    try {
+      if (d.writeChar.writeValueWithoutResponse) await d.writeChar.writeValueWithoutResponse(buf);
+      else await d.writeChar.writeValue(buf);
+    } catch (e) { log(`初始化写入失败（${d.label}）：` + e.message); }
+    await new Promise((r) => setTimeout(r, 30));
   }
-  setStatus("Ble", "bad", "蓝牙：断开，请重新点连接");
+  log(`🎉 ${d.label} 就绪（已发初始化握手）`);
+  bleStatus();
+}
+
+async function onDisconnected(d) {
+  d.writeChar = null;
+  bleStatus();
+  log(`${d.label} 断开，尝试重连`);
+  for (let i = 0; i < 20 && !d.device.gatt.connected; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    try { await connectGatt(d); return; } catch (e) { log(`重连 ${d.label} 失败：` + e.message); }
+  }
+  log(`${d.label} 重连失败，请刷新页面重新连接`);
+}
+
+async function addDevice() {
+  const device = await navigator.bluetooth.requestDevice({
+    filters: [{ namePrefix: NAME_PREFIX }],
+    optionalServices: [SERVICE],
+  });
+  if (devs.some((d) => d.device.id === device.id)) { log("这个设备已经连过了，请选另一个"); return; }
+  const d = { device, writeChar: null, label: `${device.name || "设备"}#${devs.length + 1}` };
+  devs.push(d);
+  device.addEventListener("gattserverdisconnected", () => onDisconnected(d));
+  await connectGatt(d);
 }
 
 // ---------- 轮询服务器 ----------
@@ -271,24 +308,21 @@ $("connect").onclick = async () => {
 
   $("connect").disabled = true;
   try {
-    if (!device) {
-      device = await navigator.bluetooth.requestDevice({
-        filters: [{ namePrefix: NAME_PREFIX }],
-        optionalServices: [SERVICE],
-      });
-      device.addEventListener("gattserverdisconnected", onDisconnected);
-    }
-    await connectGatt();
+    if (!devs.length) await addDevice();
     keepAwake();
     pollLoop();
     $("connect").textContent = "已在中继";
   } catch (e) {
     log("连接失败：" + e.message);
-    setStatus("Ble", "bad", "蓝牙：连接失败");
+    bleStatus();
     $("connect").disabled = false;
   }
 };
 
+$("addDev").onclick = async () => {
+  if (!navigator.bluetooth) return log("❌ 当前浏览器不支持 Web Bluetooth");
+  try { await addDevice(); } catch (e) { log("连接失败：" + e.message); bleStatus(); }
+};
 $("test").onclick = () => execCmd({ speed: 0.2, sec: 2 });
 $("stop").onclick = () => stopNow("手动停止");
 </script>
