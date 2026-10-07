@@ -13,9 +13,10 @@ let lastUpdate = 0;
 let lastPoll = 0; // 中继最后一次来取指令的时间，用来判断是否在线
 
 function checkSecret(req, res, next) {
-  const secret = req.query.secret || req.headers["x-bridge-secret"];
+  const secret = req.params.secret || req.query.secret || req.headers["x-bridge-secret"];
   if (secret !== SECRET) {
-    return res.status(401).json({ error: "unauthorized" });
+    // 回 404 而不是 401：401 会让 Claude.ai 以为需要 OAuth 登录，连接器就会卡在「需要重新连接」
+    return res.status(404).json({ error: "not found" });
   }
   next();
 }
@@ -147,7 +148,7 @@ function handleRpc(msg) {
   }
 }
 
-app.post("/mcp", checkSecret, (req, res) => {
+app.post(["/mcp", "/mcp/:secret"], checkSecret, (req, res) => {
   const body = req.body;
   if (Array.isArray(body)) {
     const replies = body.map(handleRpc).filter(Boolean);
@@ -159,8 +160,8 @@ app.post("/mcp", checkSecret, (req, res) => {
 });
 
 // 不提供 SSE 推送流
-app.get("/mcp", checkSecret, (req, res) => res.status(405).set("Allow", "POST").end());
-app.delete("/mcp", checkSecret, (req, res) => res.status(405).set("Allow", "POST").end());
+app.get(["/mcp", "/mcp/:secret"], checkSecret, (req, res) => res.status(405).set("Allow", "POST").end());
+app.delete(["/mcp", "/mcp/:secret"], checkSecret, (req, res) => res.status(405).set("Allow", "POST").end());
 
 app.get("/", (req, res) => res.send("SVAKOM Bridge is running"));
 
