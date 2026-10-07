@@ -53,7 +53,7 @@ async def write(buf):
 
 async def exec_cmd(c: dict):
     global current_cmd, current_until
-    if c.get("stop"):
+    if c.get("stop") or c.get("type") == "stop":
         current_cmd = None; current_until = 0
         await write(cmd_scale_stop()); log("⏹ 停止"); return
     if "pattern" in c:

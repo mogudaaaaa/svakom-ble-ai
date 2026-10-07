@@ -1,7 +1,23 @@
 import express from "express";
+import { fileURLToPath } from "url";
+import path from "path";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json());
+
+// 允许从其他来源打开的中继网页访问（本地 toy.html、别的静态站）
+// 没有这段，浏览器预检 OPTIONS 会被 404 挡掉，中继请求根本到不了 /toy-next
+app.use((req, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Headers", "content-type, x-bridge-secret");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
+// 手机网页中继：安卓 Chrome 打开 https://你的地址/relay
+app.get("/relay", (req, res) => res.sendFile(path.join(__dirname, "relay.html")));
 
 const SECRET = process.env.BRIDGE_SECRET || "change-me";
 const PORT = process.env.PORT || 3000;

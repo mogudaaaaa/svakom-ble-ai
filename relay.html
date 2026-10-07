@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#15171c">
+<title>BLE 中继</title>
+<style>
+  :root {
+    --bg: #15171c; --card: #1f2229; --line: #2e323b; --text: #e8e9ec; --dim: #8b909b;
+    --ok: #4fbf8a; --warn: #e0a64a; --bad: #e0605a; --accent: #7a8cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif; }
+  main { max-width: 480px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  label { display: block; color: var(--dim); font-size: 13px; margin: 0 0 4px; }
+  input { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+          border-radius: 8px; padding: 10px; font-size: 15px; margin-bottom: 10px; }
+  button { width: 100%; border: 0; border-radius: 10px; padding: 13px; font-size: 16px; font-weight: 600;
+           background: var(--accent); color: #fff; margin-top: 4px; }
+  button.secondary { background: var(--line); color: var(--text); }
+  button:disabled { opacity: .5; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .status { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  #log { font: 12px/1.45 ui-monospace, Menlo, monospace; color: var(--dim); max-height: 260px;
+         overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  .hint { color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>BLE 中继</h1>
+
+  <div class="card">
+    <label for="url">服务器地址</label>
+    <input id="url" inputmode="url" autocomplete="off" placeholder="https://xxx.up.railway.app">
+    <label for="secret">Secret</label>
+    <input id="secret" type="password" autocomplete="off" placeholder="BRIDGE_SECRET">
+    <button id="connect">连接设备并开始中继</button>
+  </div>
+
+  <div class="card status">
+    <span class="dot" id="dotBle"></span><span id="txtBle">蓝牙：未连接</span>
+    <span class="dot" id="dotNet"></span><span id="txtNet">服务器：未开始轮询</span>
+    <span class="dot" id="dotWake"></span><span id="txtWake">屏幕常亮：未开启</span>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button class="secondary" id="test">测试 20%（2秒）</button>
+      <button class="secondary" id="stop">停止</button>
+    </div>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+
+  <p class="hint">需要安卓 Chrome / Edge。保持本页在前台、屏幕亮着；切走或锁屏会断开。不要同时运行 bridge.py。</p>
+</main>
+
+<script>
+const SERVICE = 0xffe0;
+const WRITE_CHAR = 0xffe1;
+const NAME_PREFIX = "SL278";
+const POLL_MS = 300;
+const KEEPALIVE_MS = 1500;
+
+const $ = (id) => document.getElementById(id);
+let device = null, writeChar = null;
+let currentBuf = null, currentUntil = 0;
+let polling = false, wakeLock = null, pollFailCount = 0;
+
+// ---------- UI ----------
+function log(s) {
+  const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const el = $("log");
+  el.textContent = `[${t}] ${s}\n` + el.textContent.slice(0, 6000);
+}
+function setStatus(which, state, text) {
+  $("dot" + which).className = "dot " + state;
+  $("txt" + which).textContent = text;
+}
+
+// 默认填当前站点地址（页面由服务器自己托管时同源，免 CORS）
+try {
+  $("url").value = localStorage.getItem("relay_url") || location.origin;
+  $("secret").value = localStorage.getItem("relay_secret") || "";
+} catch (e) { $("url").value = location.origin; }
+
+function baseUrl() {
+  return $("url").value.trim().replace(/\/+$/, "").replace(/\/toy-next.*$/, "");
+}
+
+// ---------- 设备指令（与 bridge.py 相同） ----------
+const H = 0x55;
+const cmdScale = (v) => new Uint8Array([H, 4, 0, 0, 1, Math.max(0, Math.min(255, v)), 0xAA]);
+const cmdStop = () => new Uint8Array([H, 4, 0, 0, 0, 0, 0xAA]);
+const cmdVibrate = (mode, level) =>
+  new Uint8Array([H, 3, 0, 0, Math.max(1, Math.min(8, mode)), Math.max(1, Math.min(5, level)), 0]);
+
+let writing = Promise.resolve();
+function write(buf) {
+  // 串行写入，避免 "GATT operation already in progress"
+  writing = writing.then(async () => {
+    if (!writeChar) return;
+    try {
+      if (writeChar.writeValueWithoutResponse) await writeChar.writeValueWithoutResponse(buf);
+      else await writeChar.writeValue(buf);
+    } catch (e) { log("写入失败：" + e.message); }
+  });
+  return writing;
+}
+
+function durationUntil(c) {
+  for (const k of ["sec", "seconds", "duration"]) {
+    const s = Number(c[k]);
+    if (s > 0) return Date.now() + s * 1000;
+  }
+  return 0;
+}
+
+async function stopNow(reason) {
+  currentBuf = null; currentUntil = 0;
+  await write(cmdStop());
+  log("⏹ " + reason);
+}
+
+async function execCmd(c) {
+  // 兼容服务器的 {type:"stop"} 和旧格式 {stop:true}
+  if (c.type === "stop" || c.stop) return stopNow("停止");
+
+  if (c.type === "pattern" || "pattern" in c) {
+    const mode = Math.round(Number(c.pattern) || 1);
+    const lvl = Math.max(1, Math.round((c.level ?? 0.6) * 5));
+    currentBuf = cmdVibrate(mode, lvl);
+    currentUntil = durationUntil(c);
+    await write(currentBuf);
+    return log(`🌀 花样 ${mode}，档位 ${lvl}`);
+  }
+
+  const val = c.speed ?? c.suck ?? c.intensity;
+  if (val !== undefined && val !== null) {
+    const v = Number(val);
+    if (!(v > 0)) return stopNow("强度 0");
+    currentBuf = cmdScale(Math.round(Math.min(1, v) * 255));
+    currentUntil = durationUntil(c);
+    await write(currentBuf);
+    return log(`📳 强度 ${Math.round(v * 100)}%` + (currentUntil ? `，${c.sec}s 后停` : ""));
+  }
+  log("未识别的指令：" + JSON.stringify(c));
+}
+
+// ---------- 续命 + 到时自动停 ----------
+setInterval(async () => {
+  if (currentUntil && Date.now() >= currentUntil) return stopNow("到时自动停");
+  if (currentBuf) await write(currentBuf);
+}, KEEPALIVE_MS);
+
+// ---------- 蓝牙 ----------
+async function connectGatt() {
+  setStatus("Ble", "warn", "蓝牙：连接中…");
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SERVICE);
+  writeChar = await svc.getCharacteristic(WRITE_CHAR);
+  setStatus("Ble", "ok", `蓝牙：已连接 ${device.name || ""}`);
+  log("🎉 蓝牙就绪");
+}
+
+async function onDisconnected() {
+  writeChar = null;
+  setStatus("Ble", "bad", "蓝牙：已断开，重连中…");
+  log("蓝牙断开，尝试重连");
+  for (let i = 0; i < 20 && device && !device.gatt.connected; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    try { await connectGatt(); return; } catch (e) { log("重连失败：" + e.message); }
+  }
+  setStatus("Ble", "bad", "蓝牙：断开，请重新点连接");
+}
+
+// ---------- 轮询服务器 ----------
+async function pollLoop() {
+  if (polling) return;
+  polling = true;
+  while (polling) {
+    try {
+      const r = await fetch(`${baseUrl()}/toy-next?secret=${encodeURIComponent($("secret").value)}`,
+                            { cache: "no-store" });
+      if (r.status === 404) {
+        setStatus("Net", "bad", "服务器：404，Secret 不对或地址错");
+        pollFailCount++;
+      } else if (!r.ok) {
+        setStatus("Net", "bad", `服务器：HTTP ${r.status}`);
+        pollFailCount++;
+      } else {
+        if (pollFailCount || !$("txtNet").textContent.includes("轮询中")) {
+          setStatus("Net", "ok", "服务器：轮询中");
+          if (pollFailCount) log("服务器恢复");
+        }
+        pollFailCount = 0;
+        const c = await r.json();
+        if (c && c.type !== "hello") { log("📨 " + JSON.stringify(c)); await execCmd(c); }
+      }
+    } catch (e) {
+      pollFailCount++;
+      setStatus("Net", "bad", "服务器：请求失败（网络或 CORS）");
+      if (pollFailCount === 1 || pollFailCount % 20 === 0) log("轮询失败：" + e.message);
+    }
+    await new Promise((r) => setTimeout(r, pollFailCount ? 2000 : POLL_MS));
+  }
+}
+
+// ---------- 屏幕常亮 ----------
+async function keepAwake() {
+  if (!("wakeLock" in navigator)) return setStatus("Wake", "warn", "屏幕常亮：浏览器不支持，请手动调长息屏");
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    setStatus("Wake", "ok", "屏幕常亮：已开启");
+    wakeLock.addEventListener("release", () => setStatus("Wake", "warn", "屏幕常亮：已释放"));
+  } catch (e) { setStatus("Wake", "warn", "屏幕常亮：失败 " + e.message); }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && polling) keepAwake();
+});
+
+// ---------- 按钮 ----------
+$("connect").onclick = async () => {
+  if (!navigator.bluetooth) {
+    log("❌ 当前浏览器不支持 Web Bluetooth，请用安卓 Chrome / Edge，并确认是 https 页面");
+    return;
+  }
+  if (!$("secret").value) { log("请先填 Secret"); return; }
+  try {
+    localStorage.setItem("relay_url", baseUrl());
+    localStorage.setItem("relay_secret", $("secret").value);
+  } catch (e) {}
+
+  $("connect").disabled = true;
+  try {
+    if (!device) {
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: NAME_PREFIX }],
+        optionalServices: [SERVICE],
+      });
+      device.addEventListener("gattserverdisconnected", onDisconnected);
+    }
+    await connectGatt();
+    keepAwake();
+    pollLoop();
+    $("connect").textContent = "已在中继";
+  } catch (e) {
+    log("连接失败：" + e.message);
+    setStatus("Ble", "bad", "蓝牙：连接失败");
+    $("connect").disabled = false;
+  }
+};
+
+$("test").onclick = () => execCmd({ speed: 0.2, sec: 2 });
+$("stop").onclick = () => stopNow("手动停止");
+</script>
+</body>
+</html>
