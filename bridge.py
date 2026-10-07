@@ -71,6 +71,17 @@ async def exec_cmd(c: dict):
     if c.get("stop") or c.get("type") == "stop":
         current_cmd = None; current_until = 0
         await stop_all(); log("⏹ 停止"); return
+    if c.get("type") == "raw":
+        # 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/8/9（都走 FFE1 控制通道）
+        try:
+            b = bytes(int(x, 16) for x in str(c.get("hex", "")).replace(",", " ").split())
+        except ValueError:
+            b = b""
+        if not (6 <= len(b) <= 8 and b[0] == 0x55 and b[1] in (3, 4, 8, 9)):
+            log(f"🚫 拒绝原始指令：{c.get('hex')}"); return
+        current_cmd = b
+        current_until = parse_duration(c)
+        await write(current_cmd); log(f"🧪 原始指令 {b.hex(' ')}"); return
     if c.get("type") == "suck":
         lv = float(c.get("level", 0.6))
         if lv <= 0:

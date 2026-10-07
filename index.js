@@ -180,6 +180,18 @@ const TOOLS = [
     }
   },
   {
+    name: "toy_raw",
+    description: "调试用：直接发一条原始 BLE 指令（十六进制，空格分隔），用来实测新指令格式。只允许 55 开头、6-8 字节、指令号 03/04/08/09。默认 sec 秒后自动停",
+    inputSchema: {
+      type: "object",
+      properties: {
+        hex: { type: "string", description: "例如 \"55 09 00 00 01 05 00\"" },
+        sec: { type: "number", description: "持续秒数，默认 5" }
+      },
+      required: ["hex"]
+    }
+  },
+  {
     name: "toy_stop",
     description: "立即停止",
     inputSchema: { type: "object", properties: {} }
@@ -310,6 +322,18 @@ function callTool(name, args) {
       pushCmd({ type: "suck", mode, level, sec: Number(args.sec) || 0 });
       return text(`已设置吮吸模式 ${mode}，强度 ${level}`);
     }
+    case "toy_raw": {
+      const parts = String(args.hex || "").trim().split(/[\s,]+/);
+      const bytes = parts.map((h) => parseInt(h, 16));
+      if (bytes.length < 6 || bytes.length > 8 || bytes.some((b) => !(b >= 0 && b <= 255)) ||
+          bytes[0] !== 0x55 || ![3, 4, 8, 9].includes(bytes[1])) {
+        throw new Error("只允许 55 开头、6-8 字节、指令号 03/04/08/09 的指令");
+      }
+      cancelSeq();
+      const hex = bytes.map((b) => b.toString(16).padStart(2, "0")).join(" ");
+      pushCmd({ type: "raw", hex, sec: clamp(Number(args.sec) || 5, 1, 60) });
+      return text(`已发送原始指令 ${hex}`);
+    }
     case "toy_stop":
       cancelSeq();
       currentCmd = { type: "stop" };
@@ -380,7 +404,7 @@ function handleRpc(msg) {
       return ok({
         protocolVersion: PROTOCOL_VERSIONS.includes(wanted) ? wanted : PROTOCOL_VERSIONS[0],
         capabilities: { tools: {} },
-        serverInfo: { name: "svakom-bridge", version: "1.3.0" }
+        serverInfo: { name: "svakom-bridge", version: "1.4.0" }
       });
     }
     case "ping":

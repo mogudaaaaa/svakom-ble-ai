@@ -150,6 +150,19 @@ async function execCmd(c) {
     return log(`🌀 花样 ${mode}，档位 ${lvl}`);
   }
 
+  // 调试用原始指令：只允许 0x55 开头、6-8 字节、指令号 3/4/8/9（都走 FFE1 控制通道）
+  if (c.type === "raw") {
+    const bytes = String(c.hex || "").trim().split(/[\s,]+/).map((h) => parseInt(h, 16));
+    if (bytes.length < 6 || bytes.length > 8 || bytes.some((b) => !(b >= 0 && b <= 255)) ||
+        bytes[0] !== 0x55 || ![3, 4, 8, 9].includes(bytes[1])) {
+      return log("🚫 拒绝原始指令：" + c.hex);
+    }
+    currentBuf = new Uint8Array(bytes);
+    currentUntil = durationUntil(c);
+    await write(currentBuf);
+    return log("🧪 原始指令 " + bytes.map((b) => b.toString(16).padStart(2, "0")).join(" "));
+  }
+
   if (c.type === "suck") {
     const mode = Math.round(Number(c.mode) || 1);
     const lvl = Math.max(1, Math.round((c.level ?? 0.6) * 10));
