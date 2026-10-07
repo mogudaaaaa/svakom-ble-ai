@@ -205,7 +205,9 @@ async function execCmd(c) {
 // ---------- 续命 + 到时自动停 ----------
 setInterval(async () => {
   if (currentUntil && Date.now() >= currentUntil) return stopNow("到时自动停");
-  if (currentBuf) await write(currentBuf);
+  // 只给整体强度（55 04）续命。震动/伸缩/吮吸的模式指令重发会让节奏从头开始，
+  // 导致有间隔的模式永远停在开头那段，所以只发一次
+  if (currentBuf && currentBuf[1] === 4) await write(currentBuf);
 }, KEEPALIVE_MS);
 
 // ---------- 蓝牙（支持同时连多个设备） ----------

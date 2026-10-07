@@ -147,7 +147,9 @@ async def keepalive_loop():
         await asyncio.sleep(KEEPALIVE_SEC)
         if current_until and time.monotonic() >= current_until:
             await stop_all(); log("⏱ 到时自动停"); continue
-        if current_cmd is not None:
+        # 只给整体强度（55 04）续命。震动/伸缩/吮吸的模式指令重发会让节奏从头开始，
+        # 导致有间隔的模式永远停在开头那段，所以只发一次
+        if current_cmd is not None and current_cmd[1] == 4:
             await write(current_cmd)
 
 
