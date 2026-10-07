@@ -5,12 +5,13 @@ app.use(express.json());
 
 const SECRET = process.env.BRIDGE_SECRET || "change-me";
 const PORT = process.env.PORT || 3000;
+const PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 // 简单内存队列，存最新一条指令
 let currentCmd = null;
 let lastUpdate = 0;
+let lastPoll = 0; // 中继最后一次来取指令的时间，用来判断是否在线
 
-// 校验 secret
 function checkSecret(req, res, next) {
   const secret = req.query.secret || req.headers["x-bridge-secret"];
   if (secret !== SECRET) {
@@ -19,124 +20,148 @@ function checkSecret(req, res, next) {
   next();
 }
 
-// 安卓网页轮询用：获取下一条指令
+// 中继轮询：获取下一条指令
 app.get("/toy-next", checkSecret, (req, res) => {
+  lastPoll = Date.now();
   if (currentCmd && Date.now() - lastUpdate < 15000) {
-    // 15秒内有效
     const cmd = currentCmd;
-    currentCmd = null; // 取走后清空，避免重复执行
+    currentCmd = null;
     return res.json(cmd);
   }
   res.json({ type: "hello" });
 });
 
-// 简单设置指令接口（方便测试）
+// 测试用：直接设置指令
 app.post("/toy", checkSecret, (req, res) => {
   currentCmd = req.body;
   lastUpdate = Date.now();
   res.json({ ok: true });
 });
 
-// Claude MCP 用的简易接口
-app.post("/mcp", checkSecret, (req, res) => {
-  // 这里只做最基础的工具调用转发，够用
-  const { method, params } = req.body || {};
+// ---------------- MCP（Streamable HTTP + JSON-RPC 2.0） ----------------
 
-  if (method === "tools/list") {
-    return res.json({
-      tools: [
-        {
-          name: "toy_set_speed",
-          description: "设置分欣强度 (0.0-1.0)",
-          inputSchema: {
-            type: "object",
-            properties: {
-              speed: { type: "number", description: "0.0 ~ 1.0" },
-              sec: { type: "number", description: "持续秒数，可选" }
-            },
-            required: ["speed"]
-          }
-        },
-        {
-          name: "toy_set_pattern",
-          description: "设置振动花样",
-          inputSchema: {
-            type: "object",
-            properties: {
-              pattern: { type: "number", description: "1-8" },
-              level: { type: "number", description: "0.0-1.0" }
-            },
-            required: ["pattern"]
-          }
-        },
-        {
-          name: "toy_stop",
-          description: "立即停止",
-          inputSchema: { type: "object", properties: {} }
-        },
-        {
-          name: "toy_status",
-          description: "查询中继状态",
-          inputSchema: { type: "object", properties: {} }
-        }
-      ]
-    });
+const TOOLS = [
+  {
+    name: "toy_set_speed",
+    description: "设置强度 (0.0-1.0)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        speed: { type: "number", description: "0.0 ~ 1.0" },
+        sec: { type: "number", description: "持续秒数，可选" }
+      },
+      required: ["speed"]
+    }
+  },
+  {
+    name: "toy_set_pattern",
+    description: "设置振动花样",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "number", description: "1-8" },
+        level: { type: "number", description: "0.0-1.0" }
+      },
+      required: ["pattern"]
+    }
+  },
+  {
+    name: "toy_stop",
+    description: "立即停止",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "toy_status",
+    description: "查询中继是否在线",
+    inputSchema: { type: "object", properties: {} }
   }
+];
 
-  if (method === "tools/call") {
-    const name = params?.name;
-    const args = params?.arguments || {};
+const text = (t) => ({ content: [{ type: "text", text: t }] });
 
-    if (name === "toy_set_speed") {
+function callTool(name, args) {
+  switch (name) {
+    case "toy_set_speed":
       currentCmd = {
         type: "speed",
-        speed: Math.max(0, Math.min(1, args.speed || 0)),
-        sec: args.sec || 0
+        speed: Math.max(0, Math.min(1, Number(args.speed) || 0)),
+        sec: Number(args.sec) || 0
       };
       lastUpdate = Date.now();
-      return res.json({ content: [{ type: "text", text: `已设置强度 ${currentCmd.speed}` }] });
-    }
-
-    if (name === "toy_set_pattern") {
+      return text(`已设置强度 ${currentCmd.speed}`);
+    case "toy_set_pattern":
       currentCmd = {
         type: "pattern",
-        pattern: args.pattern || 1,
-        level: args.level || 0.7
+        pattern: Math.max(1, Math.min(8, Math.round(Number(args.pattern) || 1))),
+        level: Math.max(0, Math.min(1, args.level ?? 0.7))
       };
       lastUpdate = Date.now();
-      return res.json({ content: [{ type: "text", text: `已设置花样 ${currentCmd.pattern}` }] });
-    }
-
-    if (name === "toy_stop") {
+      return text(`已设置花样 ${currentCmd.pattern}`);
+    case "toy_stop":
       currentCmd = { type: "stop" };
       lastUpdate = Date.now();
-      return res.json({ content: [{ type: "text", text: "已停止" }] });
+      return text("已停止");
+    case "toy_status": {
+      const ago = lastPoll ? Math.round((Date.now() - lastPoll) / 1000) : null;
+      const online = ago !== null && ago < 5;
+      return text(
+        online
+          ? `中继在线（${ago} 秒前轮询）`
+          : ago === null
+            ? "中继离线：服务启动后还没有中继来轮询"
+            : `中继离线：最后一次轮询在 ${ago} 秒前`
+      );
     }
+    default:
+      return null;
+  }
+}
 
-    if (name === "toy_status") {
-      return res.json({
-        content: [{
-          type: "text",
-          text: currentCmd
-            ? `中继在线，最近指令：${JSON.stringify(currentCmd)}`
-            : "中继在线，暂无指令"
-        }]
+function handleRpc(msg) {
+  const { id, method, params } = msg || {};
+  const isNotification = id === undefined || id === null;
+  const ok = (result) => ({ jsonrpc: "2.0", id, result });
+  const err = (code, message) => ({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
+
+  if (isNotification) return null; // notifications/initialized 等，不需要回复
+
+  switch (method) {
+    case "initialize": {
+      const wanted = params?.protocolVersion;
+      return ok({
+        protocolVersion: PROTOCOL_VERSIONS.includes(wanted) ? wanted : PROTOCOL_VERSIONS[0],
+        capabilities: { tools: {} },
+        serverInfo: { name: "svakom-bridge", version: "1.1.0" }
       });
     }
+    case "ping":
+      return ok({});
+    case "tools/list":
+      return ok({ tools: TOOLS });
+    case "tools/call": {
+      const result = callTool(params?.name, params?.arguments || {});
+      return result ? ok(result) : err(-32602, `unknown tool: ${params?.name}`);
+    }
+    default:
+      return err(-32601, `method not found: ${method}`);
   }
+}
 
-  res.json({ error: "unknown method" });
+app.post("/mcp", checkSecret, (req, res) => {
+  const body = req.body;
+  if (Array.isArray(body)) {
+    const replies = body.map(handleRpc).filter(Boolean);
+    return replies.length ? res.json(replies) : res.status(202).end();
+  }
+  const reply = handleRpc(body);
+  if (!reply) return res.status(202).end();
+  res.json(reply);
 });
 
-// 兼容 Claude 用 GET 方式探测
-app.get("/mcp", checkSecret, (req, res) => {
-  res.json({ status: "ok", message: "svakom bridge ready" });
-});
+// 不提供 SSE 推送流
+app.get("/mcp", checkSecret, (req, res) => res.status(405).set("Allow", "POST").end());
+app.delete("/mcp", checkSecret, (req, res) => res.status(405).set("Allow", "POST").end());
 
-app.get("/", (req, res) => {
-  res.send("SVAKOM Bridge is running");
-});
+app.get("/", (req, res) => res.send("SVAKOM Bridge is running"));
 
-app.listen(PORT, () => {
-  console.log(`Bridge running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Bridge running on port ${PORT}`));
