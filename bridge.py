@@ -35,6 +35,21 @@ def cmd_scale_stop():
 def cmd_vibrate(mode, level):
     return bytes([H, 3, 0, 0, max(1,min(8,mode)), max(1,min(5,level)), 0])
 
+def cmd_suck(mode, level):
+    # 吮吸：55 09 00 00 <模式> <强度 1-10>（格式来自 Buttplug 对同系列 SL278B 的抓包）
+    return bytes([H, 9, 0, 0, max(1, min(10, mode)), max(1, min(10, level))])
+
+def cmd_suck_stop():
+    return bytes([H, 9, 0, 0, 0, 0])
+
+def cmd_vibrate_stop():
+    return bytes([H, 3, 0, 0, 0, 0])
+
+async def stop_all():
+    await write(cmd_scale_stop())
+    await write(cmd_suck_stop())
+    await write(cmd_vibrate_stop())
+
 def parse_duration(c):
     for k in ["sec", "seconds", "duration"]:
         if k in c:
@@ -55,18 +70,28 @@ async def exec_cmd(c: dict):
     global current_cmd, current_until
     if c.get("stop") or c.get("type") == "stop":
         current_cmd = None; current_until = 0
-        await write(cmd_scale_stop()); log("⏹ 停止"); return
+        await stop_all(); log("⏹ 停止"); return
+    if c.get("type") == "suck":
+        lv = float(c.get("level", 0.6))
+        if lv <= 0:
+            current_cmd = None; current_until = 0
+            await stop_all(); log("⏹ 吮吸 0"); return
+        mode = int(c.get("mode", 1))
+        level = max(1, round(lv * 10))
+        current_cmd = cmd_suck(mode, level)
+        current_until = parse_duration(c)
+        await write(current_cmd); log(f"💨 吮吸模式 {mode}，强度 {level}/10"); return
     if "pattern" in c:
         mode = int(c["pattern"])
         level = max(1, round(c.get("level", 0.6) * 5))
         current_cmd = cmd_vibrate(mode, level)
         current_until = parse_duration(c)
         await write(current_cmd); log(f"🌀 花样 {mode} 档"); return
-    val = c.get("speed") or c.get("suck") or c.get("intensity")
+    val = c.get("speed") or c.get("intensity")
     if val is not None:
         if float(val) <= 0:
             current_cmd = None; current_until = 0
-            await write(cmd_scale_stop()); log("⏹ 强度 0"); return
+            await stop_all(); log("⏹ 强度 0"); return
         current_cmd = cmd_scale(int(float(val) * 255))
         current_until = parse_duration(c)
         await write(current_cmd); log(f"📳 强度 {round(float(val)*100)}%")
@@ -77,7 +102,7 @@ async def keepalive_loop():
         await asyncio.sleep(KEEPALIVE_SEC)
         if current_until and time.monotonic() >= current_until:
             current_cmd = None; current_until = 0
-            await write(cmd_scale_stop()); log("⏱ 到时自动停"); continue
+            await stop_all(); log("⏱ 到时自动停"); continue
         if current_cmd is not None:
             await write(current_cmd)
 

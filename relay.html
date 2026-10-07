@@ -102,6 +102,11 @@ const cmdScale = (v) => new Uint8Array([H, 4, 0, 0, 1, Math.max(0, Math.min(255,
 const cmdStop = () => new Uint8Array([H, 4, 0, 0, 0, 0, 0xAA]);
 const cmdVibrate = (mode, level) =>
   new Uint8Array([H, 3, 0, 0, Math.max(1, Math.min(8, mode)), Math.max(1, Math.min(5, level)), 0]);
+// 吮吸：55 09 00 00 <模式> <强度 1-10>（格式来自 Buttplug 对同系列 SL278B 的抓包）
+const cmdSuck = (mode, level) =>
+  new Uint8Array([H, 9, 0, 0, Math.max(1, Math.min(10, mode)), Math.max(1, Math.min(10, level))]);
+const cmdSuckStop = () => new Uint8Array([H, 9, 0, 0, 0, 0]);
+const cmdVibrateStop = () => new Uint8Array([H, 3, 0, 0, 0, 0]);
 
 let writing = Promise.resolve();
 function write(buf) {
@@ -127,6 +132,8 @@ function durationUntil(c) {
 async function stopNow(reason) {
   currentBuf = null; currentUntil = 0;
   await write(cmdStop());
+  await write(cmdSuckStop());
+  await write(cmdVibrateStop());
   log("⏹ " + reason);
 }
 
@@ -143,7 +150,17 @@ async function execCmd(c) {
     return log(`🌀 花样 ${mode}，档位 ${lvl}`);
   }
 
-  const val = c.speed ?? c.suck ?? c.intensity;
+  if (c.type === "suck") {
+    const mode = Math.round(Number(c.mode) || 1);
+    const lvl = Math.max(1, Math.round((c.level ?? 0.6) * 10));
+    if (!((c.level ?? 0.6) > 0)) return stopNow("吮吸 0");
+    currentBuf = cmdSuck(mode, lvl);
+    currentUntil = durationUntil(c);
+    await write(currentBuf);
+    return log(`💨 吮吸模式 ${mode}，强度 ${lvl}/10`);
+  }
+
+  const val = c.speed ?? c.intensity;
   if (val !== undefined && val !== null) {
     const v = Number(val);
     if (!(v > 0)) return stopNow("强度 0");
